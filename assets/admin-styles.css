@@ -1,0 +1,10 @@
+/* WD Store Suite Admin Styles */
+.wrap h1 {
+  color: #222;
+  border-bottom: 2px solid #111;
+  padding-bottom: 5px;
+}
+.form-table th {
+  width: 200px;
+  text-align: left;
+}
