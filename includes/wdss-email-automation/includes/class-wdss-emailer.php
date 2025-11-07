@@ -2,7 +2,7 @@
 /**
  * WD Store Suite - Automated Emails (Per-Template Automations + Idempotency)
  * Author: Warf Designs LLC
- * Version: 1.5.4
+ * Version: 1.5.5
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
@@ -13,7 +13,7 @@ class WDSS_Emailer {
 
     private static $instance = null;
 
-    const VERSION        = '1.5.4';
+    const VERSION        = '1.5.5';
     const RULES_OPTION   = 'wdss_email_rules_v1';
     const LOG_OPTION     = 'wdss_email_log_v1';
     const IDEM_OPTION    = 'wdss_email_idem_v1';
@@ -72,7 +72,7 @@ class WDSS_Emailer {
         add_action( 'admin_post_' . self::ACTION_PREVIEW,   array( $this, 'handle_preview' ) );
         add_action( 'admin_post_' . self::ACTION_TEST_RULE, array( $this, 'handle_test_rule' ) );
 
-        // Bridge (events come from your order system / bridge class)
+        // Bridge (events are fired by your order code / bridge)
         add_action( 'wdss29_order_created',        function( $order_id, $payload = array() ) { $this->trigger('order.created', $order_id, (array)$payload); }, 10, 2 );
         add_action( 'wdss29_order_paid',           function( $order_id, $payload = array() ) { $this->trigger('order.paid',    $order_id, (array)$payload); }, 10, 2 );
         add_action( 'wdss29_order_status_changed', function( $order_id, $status, $payload = array() ) {
@@ -361,7 +361,6 @@ class WDSS_Emailer {
 
         // Generate rules from this template’s selections
         $rules = get_option( self::RULES_OPTION, array() );
-        // Remove old template-driven rules for this post (name starts with TPL:)
         $rules = array_values( array_filter( $rules, function($r) use ($post_id){
             if ( empty($r['template_id']) ) return true;
             if ( intval($r['template_id']) !== intval($post_id) ) return true;
@@ -397,7 +396,10 @@ class WDSS_Emailer {
             'orderby'     => 'title',
             'order'       => 'ASC'
         ) );
-        $nonce = wp_create_nonce( self::NONCE_KEY );
+
+        // Generate a fresh nonce and base URL for Test
+        $nonce          = wp_create_nonce( self::NONCE_KEY );
+        $test_base_url  = admin_url( 'admin-post.php?action=' . self::ACTION_TEST_RULE );
         ?>
         <div class="wrap">
             <h1><?php _e( 'Email Automations', 'wdss' ); ?></h1>
@@ -434,7 +436,7 @@ class WDSS_Emailer {
 
             <script>
             (function($){
-                function rowTemplate(i, nonce){
+                function rowTemplate(i){
                     return `
 <tr>
   <td><input type="checkbox" name="<?php echo self::RULES_OPTION; ?>[${i}][enabled]" value="1" checked /></td>
@@ -474,7 +476,7 @@ class WDSS_Emailer {
 
                 $('#wdss-add-rule').on('click', function(){
                     var i = $('#wdss-rules-table tbody tr').length;
-                    $('#wdss-rules-table tbody').append( rowTemplate(i, '<?php echo esc_js( $nonce ); ?>') );
+                    $('#wdss-rules-table tbody').append( rowTemplate(i) );
                 });
 
                 $(document).on('click','.wdss-remove-rule', function(){
@@ -487,14 +489,14 @@ class WDSS_Emailer {
                     else $row.find('.wdss-recipient-email').hide();
                 });
 
-                // New: Test rule without nesting forms
+                // New: Test rule using a clean nonce & URL (no nested forms, no wp_nonce_url())
+                var TEST_BASE = <?php echo wp_json_encode( $test_base_url ); ?>;
+                var TEST_NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+
                 $(document).on('click', '.wdss-test-rule', function(e){
                     e.preventDefault();
                     var idx  = $(this).data('index');
-                    var url  = '<?php echo esc_js( wp_nonce_url( admin_url('admin-post.php?action='.self::ACTION_TEST_RULE), self::NONCE_KEY ) ); ?>';
-                    // pass rule index via GET
-                    if ( url.indexOf('?') === -1 ) url += '?';
-                    url += '&rule_index=' + encodeURIComponent(idx);
+                    var url  = TEST_BASE + '&_wpnonce=' + encodeURIComponent(TEST_NONCE) + '&rule_index=' + encodeURIComponent(idx);
                     window.location.href = url;
                 });
             })(jQuery);
@@ -517,7 +519,6 @@ class WDSS_Emailer {
     }
 
     private function render_rule_row( $i, $rule, $templates, $nonce ) {
-        // Outputs exactly one row; actions column uses JS link (no nested form)
         ?>
         <tr>
             <td><input type="checkbox" name="<?php echo self::RULES_OPTION; ?>[<?php echo esc_attr($i); ?>][enabled]" value="1" <?php checked( ! empty( $rule['enabled'] ) ); ?> /></td>
@@ -825,8 +826,12 @@ class WDSS_Emailer {
 
     public function handle_test_rule() {
         if ( ! current_user_can('manage_options') ) wp_die('Denied.');
-        $ok = wp_verify_nonce( $_REQUEST['_wpnonce'] ?? '', self::NONCE_KEY );
-        if ( ! $ok ) wp_die('Invalid nonce.');
+
+        // Accept nonce from GET/POST safely
+        $nonce = isset($_REQUEST['_wpnonce']) ? sanitize_text_field( wp_unslash($_REQUEST['_wpnonce']) ) : '';
+        if ( ! $nonce || ! wp_verify_nonce( $nonce, self::NONCE_KEY ) ) {
+            wp_die('Invalid nonce.');
+        }
 
         $idx   = isset($_REQUEST['rule_index']) ? intval($_REQUEST['rule_index']) : -1;
         $rules = get_option( self::RULES_OPTION, array() );
