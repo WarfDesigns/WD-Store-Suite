@@ -2,7 +2,7 @@
 /**
  * WD Store Suite - Automated Emails (Per-Template Automations + Idempotency)
  * Author: Warf Designs LLC
- * Version: 1.5.2
+ * Version: 1.5.4
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
@@ -13,7 +13,7 @@ class WDSS_Emailer {
 
     private static $instance = null;
 
-    const VERSION        = '1.5.2';
+    const VERSION        = '1.5.4';
     const RULES_OPTION   = 'wdss_email_rules_v1';
     const LOG_OPTION     = 'wdss_email_log_v1';
     const IDEM_OPTION    = 'wdss_email_idem_v1';
@@ -24,23 +24,23 @@ class WDSS_Emailer {
     const META_HEADERS         = '_wdss_headers';
 
     // Delivery
-    const META_RECIP_SEND_TO   = '_wdss_send_to';          // array: customer, admin, custom
-    const META_RECIP_CUSTOM    = '_wdss_recipient_custom'; // comma/semicolon list
+    const META_RECIP_SEND_TO   = '_wdss_send_to';
+    const META_RECIP_CUSTOM    = '_wdss_recipient_custom';
     const META_CC              = '_wdss_cc';
     const META_BCC             = '_wdss_bcc';
     const META_REPLYTO         = '_wdss_reply_to';
 
     // Automations (per-template)
-    const META_AUTO_ENABLE     = '_wdss_auto_enable';      // 1/0
-    const META_AUTO_TRIGGERS   = '_wdss_auto_triggers';    // array of keys
-    const META_AUTO_DELAY      = '_wdss_auto_delay';       // minutes int
-    const META_AUTO_CONDITIONS = '_wdss_auto_conditions';  // string
+    const META_AUTO_ENABLE     = '_wdss_auto_enable';
+    const META_AUTO_TRIGGERS   = '_wdss_auto_triggers';
+    const META_AUTO_DELAY      = '_wdss_auto_delay';
+    const META_AUTO_CONDITIONS = '_wdss_auto_conditions';
 
     // Nonces/actions
     const NONCE_KEY            = 'wdss_email_tpl_nonce';
     const ACTION_SEND_TEST     = 'wdss_send_test_email';
     const ACTION_PREVIEW       = 'wdss_preview_template';
-    const ACTION_TEST_RULE     = 'wdss_test_rule';         // NEW
+    const ACTION_TEST_RULE     = 'wdss_test_rule';
 
     /** Singleton */
     public static function instance() {
@@ -70,9 +70,9 @@ class WDSS_Emailer {
         // Test & Preview handlers
         add_action( 'admin_post_' . self::ACTION_SEND_TEST, array( $this, 'handle_send_test' ) );
         add_action( 'admin_post_' . self::ACTION_PREVIEW,   array( $this, 'handle_preview' ) );
-        add_action( 'admin_post_' . self::ACTION_TEST_RULE, array( $this, 'handle_test_rule' ) ); // NEW
+        add_action( 'admin_post_' . self::ACTION_TEST_RULE, array( $this, 'handle_test_rule' ) );
 
-        // Bridge canonical hooks → email bus
+        // Bridge (events come from your order system / bridge class)
         add_action( 'wdss29_order_created',        function( $order_id, $payload = array() ) { $this->trigger('order.created', $order_id, (array)$payload); }, 10, 2 );
         add_action( 'wdss29_order_paid',           function( $order_id, $payload = array() ) { $this->trigger('order.paid',    $order_id, (array)$payload); }, 10, 2 );
         add_action( 'wdss29_order_status_changed', function( $order_id, $status, $payload = array() ) {
@@ -83,9 +83,6 @@ class WDSS_Emailer {
         if ( ! get_option( self::IDEM_OPTION ) ) add_option( self::IDEM_OPTION, array(), '', false );
     }
 
-    /* ======================= Helpers ======================== */
-
-    /** Triggers supported by the UI */
     private function get_supported_triggers() {
         return array(
             'order.created'        => __( 'Order Created (when order is made)', 'wdss' ),
@@ -94,7 +91,6 @@ class WDSS_Emailer {
         );
     }
 
-    /** Placeholder keys shown in the template sidebar */
     private function get_supported_placeholders() {
         return array(
             'order_id'       => __( 'Order ID', 'wdss' ),
@@ -111,7 +107,7 @@ class WDSS_Emailer {
         do_action( 'wdss_email_trigger', $event_key, $object_id, $payload );
     }
 
-    /* ================= CPT & Menus / Settings ================ */
+    /* ================= CPT & Admin Pages ================= */
 
     public function register_template_cpt() {
         $labels = array(
@@ -179,7 +175,7 @@ class WDSS_Emailer {
         return '';
     }
 
-    /* ================= Template Metaboxes ==================== */
+    /* =============== Template Metaboxes =============== */
 
     public function add_template_metaboxes() {
         add_meta_box(
@@ -327,7 +323,7 @@ class WDSS_Emailer {
         <?php
     }
 
-    /* ======================= Save Template ==================== */
+    /* =============== Save Template =============== */
 
     public function save_template_meta( $post_id, $post ) {
         if ( $post->post_type !== self::CPT_TEMPLATE ) return;
@@ -380,7 +376,7 @@ class WDSS_Emailer {
                     'trigger'         => $tkey,
                     'delay_minutes'   => $auto_delay,
                     'template_id'     => $post_id,
-                    'recipient'       => 'set', // defer to template “Send To”
+                    'recipient'       => 'set',
                     'recipient_email' => '',
                     'conditions'      => $auto_conds,
                 );
@@ -390,7 +386,7 @@ class WDSS_Emailer {
         update_option( self::RULES_OPTION, $rules, false );
     }
 
-    /* ======================== Rules UI ======================= */
+    /* =============== Rules UI (fixed Test buttons) =============== */
 
     public function render_rules_page() {
         $rules = get_option( self::RULES_OPTION, array() );
@@ -470,12 +466,7 @@ class WDSS_Emailer {
   </td>
   <td><input type="text" class="regular-text" name="<?php echo self::RULES_OPTION; ?>[${i}][conditions]" value="" placeholder="status=paid,min_total:50" /></td>
   <td>
-    <form method="post" action="<?php echo esc_url( admin_url('admin-post.php') ); ?>" style="display:inline;">
-      <input type="hidden" name="action" value="<?php echo esc_attr( self::ACTION_TEST_RULE ); ?>">
-      <input type="hidden" name="rule_index" value="${i}">
-      <input type="hidden" name="_wpnonce" value="${nonce}">
-      <button class="button"><?php echo esc_js(__('Test','wdss')); ?></button>
-    </form>
+    <a class="button wdss-test-rule" data-index="${i}" href="#"><?php echo esc_js(__('Test','wdss')); ?></a>
     <button type="button" class="button link-delete wdss-remove-rule"><?php echo esc_js(__('Remove','wdss')); ?></button>
   </td>
 </tr>`;
@@ -494,6 +485,17 @@ class WDSS_Emailer {
                     var $row = $(this).closest('tr');
                     if ( $(this).val()==='custom' ) $row.find('.wdss-recipient-email').show();
                     else $row.find('.wdss-recipient-email').hide();
+                });
+
+                // New: Test rule without nesting forms
+                $(document).on('click', '.wdss-test-rule', function(e){
+                    e.preventDefault();
+                    var idx  = $(this).data('index');
+                    var url  = '<?php echo esc_js( wp_nonce_url( admin_url('admin-post.php?action='.self::ACTION_TEST_RULE), self::NONCE_KEY ) ); ?>';
+                    // pass rule index via GET
+                    if ( url.indexOf('?') === -1 ) url += '?';
+                    url += '&rule_index=' + encodeURIComponent(idx);
+                    window.location.href = url;
                 });
             })(jQuery);
             </script>
@@ -515,6 +517,7 @@ class WDSS_Emailer {
     }
 
     private function render_rule_row( $i, $rule, $templates, $nonce ) {
+        // Outputs exactly one row; actions column uses JS link (no nested form)
         ?>
         <tr>
             <td><input type="checkbox" name="<?php echo self::RULES_OPTION; ?>[<?php echo esc_attr($i); ?>][enabled]" value="1" <?php checked( ! empty( $rule['enabled'] ) ); ?> /></td>
@@ -548,19 +551,14 @@ class WDSS_Emailer {
                 $cond_string = is_array( $rule['conditions'] ?? '' ) ? implode(',', $rule['conditions']) : ( $rule['conditions'] ?? '' );
                 echo esc_attr( $cond_string ); ?>" placeholder="status=paid,min_total:50" /></td>
             <td>
-                <form method="post" action="<?php echo esc_url( admin_url('admin-post.php') ); ?>" style="display:inline;">
-                    <input type="hidden" name="action" value="<?php echo esc_attr( self::ACTION_TEST_RULE ); ?>">
-                    <input type="hidden" name="rule_index" value="<?php echo esc_attr( $i ); ?>">
-                    <input type="hidden" name="_wpnonce" value="<?php echo esc_attr( $nonce ); ?>">
-                    <button class="button"><?php _e('Test','wdss'); ?></button>
-                </form>
+                <a class="button wdss-test-rule" data-index="<?php echo esc_attr( $i ); ?>" href="#"><?php _e('Test','wdss'); ?></a>
                 <button type="button" class="button link-delete wdss-remove-rule"><?php _e( 'Remove', 'wdss' ); ?></button>
             </td>
         </tr>
         <?php
     }
 
-    /* =================== Trigger Handling ==================== */
+    /* =============== Trigger Handling / Mail =============== */
 
     public function handle_trigger_event( $event_key, $object_id = 0, $payload = array() ) {
         $this->log_event( 'received-event', array( 'event' => $event_key, 'obj' => $object_id ) );
@@ -590,7 +588,7 @@ class WDSS_Emailer {
 
             $idem_key = $this->idem_key( $rule['template_id'] ?? 0, $payload, $event_key );
             if ( $this->idem_seen_recently( $idem_key ) ) {
-                $this->log_event( 'skip-duplicate', array( 'tpl'  => intval($rule['template_id']), 'rule' => $rule['name'] ?? '', 'ev' => $event_key ) );
+                $this->log_event( 'skip-duplicate', array( 'tpl'  => intval($rule['template_id']), 'rule' => $rule['name'] ?? '', 'ev' => $event_key, 'key' => $idem_key ) );
                 continue;
             }
 
@@ -666,7 +664,6 @@ class WDSS_Emailer {
     }
 
     private function resolve_recipient_set( $rule, $object_id, $payload ) {
-        // Manual override on rule
         if ( isset($rule['recipient']) && $rule['recipient'] !== 'set' ) {
             switch ( $rule['recipient'] ) {
                 case 'admin':  return array( get_option('admin_email') );
@@ -682,7 +679,6 @@ class WDSS_Emailer {
             }
         }
 
-        // Defer to template “Send To”
         $tpl_id   = intval( $rule['template_id'] ?? 0 );
         $send_to  = get_post_meta( $tpl_id, self::META_RECIP_SEND_TO, true );
         if ( ! is_array( $send_to ) ) $send_to = array('customer');
@@ -691,7 +687,7 @@ class WDSS_Emailer {
         foreach ( $send_to as $who ) {
             if ( $who === 'customer' ) {
                 $email = sanitize_email( $payload['customer_email'] ?? '' );
-                if ( ! $email ) { $email = get_option('admin_email'); } // fallback for testing
+                if ( ! $email ) { $email = get_option('admin_email'); }
                 if ( $email ) $targets[] = $email;
             } elseif ( $who === 'admin' ) {
                 $targets[] = get_option('admin_email');
@@ -711,7 +707,6 @@ class WDSS_Emailer {
         return '<!doctype html><html><body style="'.$styles.'">' . $content . '<hr style="margin-top:24px;border:0;border-top:1px solid #eee;"><p style="font-size:12px;color:#666;">Sent by WD Store Suite</p></body></html>';
     }
 
-    /** Supports both {{token}} and {token} syntaxes */
     private function replace_placeholders( $text, $payload ) {
         if ( ! is_string( $text ) ) return $text;
         foreach ( (array)$payload as $key => $val ) {
@@ -767,7 +762,7 @@ class WDSS_Emailer {
         return $payload;
     }
 
-    /* =================== Test & Preview ====================== */
+    /* =============== Preview / Test Handlers =============== */
 
     public function handle_send_test() {
         if ( ! current_user_can('manage_options') ) wp_die('Denied.');
@@ -828,20 +823,18 @@ class WDSS_Emailer {
         exit;
     }
 
-    /** Test a single RULE row directly from UI (bypasses external events) */
     public function handle_test_rule() {
         if ( ! current_user_can('manage_options') ) wp_die('Denied.');
-        $ok = wp_verify_nonce( $_POST['_wpnonce'] ?? '', self::NONCE_KEY );
+        $ok = wp_verify_nonce( $_REQUEST['_wpnonce'] ?? '', self::NONCE_KEY );
         if ( ! $ok ) wp_die('Invalid nonce.');
 
-        $idx   = isset($_POST['rule_index']) ? intval($_POST['rule_index']) : -1;
+        $idx   = isset($_REQUEST['rule_index']) ? intval($_REQUEST['rule_index']) : -1;
         $rules = get_option( self::RULES_OPTION, array() );
         if ( $idx < 0 || ! isset( $rules[$idx] ) ) {
             wp_safe_redirect( wp_get_referer() ?: admin_url() ); exit;
         }
         $rule = $rules[$idx];
 
-        // Sample payload for testing rule resolution & sending
         $payload = array(
             'order_id'       => 9876,
             'order_total'    => 199.50,
@@ -868,11 +861,15 @@ class WDSS_Emailer {
         wp_safe_redirect( wp_get_referer() ?: admin_url() ); exit;
     }
 
-    /* ===================== Idempotency/Logs ================== */
+    /* =============== Idempotency / Logs =============== */
 
     private function idem_key( $template_id, $payload, $event ) {
         $order_id = isset($payload['order_id']) ? (string) $payload['order_id'] : 'no-order';
-        return md5( implode('|', array( (int)$template_id, (string)$event, $order_id ) ) );
+        $extra    = '';
+        if ( $event === 'order.status_changed' ) {
+            $extra = '|' . ( isset($payload['order_status']) ? (string)$payload['order_status'] : 'unknown' );
+        }
+        return md5( implode('|', array( (int)$template_id, (string)$event, $order_id )) . $extra );
     }
 
     private function idem_seen_recently( $key ) {
