@@ -19,3 +19,4 @@ function wdss29_add_to_cart( $product_id, $qty = 1 ) {
 function wdss29_clear_cart() {
     if ( isset( $_SESSION['wdss29_cart'] ) ) unset( $_SESSION['wdss29_cart'] );
 }
+

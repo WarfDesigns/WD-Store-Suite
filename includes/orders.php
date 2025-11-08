@@ -1,6 +1,6 @@
 <?php
 /**
- * Orders — persistence + canonical status transitions
+ * Orders — persistence + status transitions
  * Author: Warf Designs LLC
  */
 
@@ -12,123 +12,119 @@ function wdss29_get_orders_table_name() {
     return $wpdb->prefix . 'wdss29_orders';
 }
 
-/**
- * Ensure table exists (dbDelta-safe)
- */
+/** Create/upgrade table */
 function wdss29_maybe_install_or_upgrade_orders_table() {
     global $wpdb;
-    $table = wdss29_get_orders_table_name();
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    $table   = wdss29_get_orders_table_name();
     $charset = $wpdb->get_charset_collate();
 
     $sql = "CREATE TABLE {$table} (
-        id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        number VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'created',
+        subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
+        tax DECIMAL(12,2) NOT NULL DEFAULT 0,
+        shipping DECIMAL(12,2) NOT NULL DEFAULT 0,
+        total DECIMAL(12,2) NOT NULL DEFAULT 0,
+        currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+        payment_method VARCHAR(32) NOT NULL DEFAULT '',
+        customer_email VARCHAR(190) NOT NULL DEFAULT '',
+        customer_name VARCHAR(190) NOT NULL DEFAULT '',
+        items LONGTEXT NULL,
         created_at DATETIME NOT NULL,
         updated_at DATETIME NOT NULL,
-        customer_email VARCHAR(190) NULL,
-        customer_name VARCHAR(190) NULL,
-        status VARCHAR(40) NOT NULL DEFAULT 'created',
-        total DECIMAL(18,2) NOT NULL DEFAULT 0.00,
-        meta LONGTEXT NULL,
         PRIMARY KEY  (id),
         KEY status (status),
-        KEY created_at (created_at)
+        KEY email (customer_email)
     ) {$charset};";
 
-    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
 }
 
-/** Fetch a single order row as array */
-function wdss29_get_order( $order_id ) {
-    global $wpdb;
-    $table = wdss29_get_orders_table_name();
-    $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $order_id ), ARRAY_A );
-    if ( $row && ! empty( $row['meta'] ) ) {
-        $meta = json_decode( $row['meta'], true );
-        if ( is_array( $meta ) ) $row['meta'] = $meta;
-    }
-    return $row;
-}
-
-/** Insert a new order — returns order_id */
-function wdss29_insert_order( $args ) {
+/** Create order row + emit 'order.created' */
+function wdss29_create_order( $args ) {
     global $wpdb;
     $table = wdss29_get_orders_table_name();
 
-    $now = current_time( 'mysql' );
-    $data = array(
-        'created_at'     => $now,
-        'updated_at'     => $now,
-        'customer_email' => sanitize_email( $args['customer_email'] ?? '' ),
-        'customer_name'  => sanitize_text_field( $args['customer_name'] ?? '' ),
-        'status'         => sanitize_text_field( $args['status'] ?? 'created' ),
-        'total'          => floatval( $args['total'] ?? 0 ),
-        'meta'           => wp_json_encode( $args['meta'] ?? array() ),
+    $defaults = array(
+        'number'         => '',
+        'status'         => 'created',
+        'subtotal'       => 0,
+        'tax'            => 0,
+        'shipping'       => 0,
+        'total'          => 0,
+        'currency'       => get_option('wdss_currency','USD'),
+        'payment_method' => '',
+        'customer_email' => '',
+        'customer_name'  => '',
+        'items'          => array(),
     );
+    $r = wp_parse_args( $args, $defaults );
 
-    $wpdb->insert( $table, $data, array( '%s','%s','%s','%s','%s','%f','%s' ) );
+    $data = array(
+        'number'         => sanitize_text_field( $r['number'] ),
+        'status'         => sanitize_text_field( $r['status'] ),
+        'subtotal'       => (float) $r['subtotal'],
+        'tax'            => (float) $r['tax'],
+        'shipping'       => (float) $r['shipping'],
+        'total'          => (float) $r['total'],
+        'currency'       => sanitize_text_field( $r['currency'] ),
+        'payment_method' => sanitize_text_field( $r['payment_method'] ),
+        'customer_email' => sanitize_email( $r['customer_email'] ),
+        'customer_name'  => sanitize_text_field( $r['customer_name'] ),
+        'items'          => maybe_serialize( is_array($r['items']) ? $r['items'] : array() ),
+        'created_at'     => current_time( 'mysql' ),
+        'updated_at'     => current_time( 'mysql' ),
+    );
+    $fmt = array( '%s','%s','%f','%f','%f','%f','%s','%s','%s','%s','%s','%s','%s' );
+
+    $ok = $wpdb->insert( $table, $data, $fmt );
+    if ( ! $ok ) return false;
+
     $order_id = (int) $wpdb->insert_id;
 
-    // Build a consistent payload
     $payload = array(
         'order_id'       => $order_id,
+        'order_number'   => $data['number'] ?: (string)$order_id,
         'order_status'   => $data['status'],
-        'order_total'    => $data['total'],
+        'order_subtotal' => (float)$data['subtotal'],
+        'order_tax'      => (float)$data['tax'],
+        'order_shipping' => (float)$data['shipping'],
+        'order_total'    => (float)$data['total'],
+        'currency'       => $data['currency'],
+        'payment_method' => $data['payment_method'],
         'customer_email' => $data['customer_email'],
         'customer_name'  => $data['customer_name'],
-        'site_name'      => get_bloginfo('name'),
-        'site_url'       => home_url('/'),
+        'items'          => is_array($r['items']) ? $r['items'] : array(),
+        'created_at'     => $data['created_at'],
+        '_idem_key'      => 'order.created|' . $order_id,
     );
 
-    // Existing internal hooks
     do_action( 'wdss29_order_created', $order_id, $payload );
-
-    // Bridge-friendly emit (if bridge class is loaded)
     do_action( 'wdss_emit_order_event', 'created', $order_id, $payload );
 
-    // NEW: Call the automation bus directly (removes dependency on bridge)
-    do_action( 'wdss_email_trigger', 'order.created', $order_id, $payload );
+    // IMPORTANT: Email Automations bus wants (event, payload)
+    do_action( 'wdss_email_trigger', 'order.created', $payload );
 
     return $order_id;
 }
 
-/** Update arbitrary order columns (safe) */
-function wdss29_update_order( $order_id, $args ) {
+/** Get order row */
+function wdss29_get_order( $order_id ) {
     global $wpdb;
     $table = wdss29_get_orders_table_name();
+    $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", (int)$order_id ), ARRAY_A );
+    if ( ! $row ) return false;
 
-    $data = array( 'updated_at' => current_time( 'mysql' ) );
-    $fmt  = array( '%s' );
+    $row['items'] = maybe_unserialize( $row['items'] );
+    if ( ! is_array( $row['items'] ) ) $row['items'] = array();
 
-    if ( array_key_exists( 'customer_email', $args ) ) {
-        $data['customer_email'] = sanitize_email( $args['customer_email'] );
-        $fmt[] = '%s';
-    }
-    if ( array_key_exists( 'customer_name', $args ) ) {
-        $data['customer_name'] = sanitize_text_field( $args['customer_name'] );
-        $fmt[] = '%s';
-    }
-    if ( array_key_exists( 'total', $args ) ) {
-        $data['total'] = floatval( $args['total'] );
-        $fmt[] = '%f';
-    }
-    if ( array_key_exists( 'meta', $args ) ) {
-        $meta = is_array( $args['meta'] ) ? $args['meta'] : array();
-        $data['meta'] = wp_json_encode( $meta );
-        $fmt[] = '%s';
-    }
-
-    $wpdb->update( $table, $data, array( 'id' => (int) $order_id ), $fmt, array( '%d' ) );
-    return true;
+    return $row;
 }
 
-/**
- * Canonical status transition (fires hooks exactly once)
- *
- * @param int    $order_id
- * @param string $new_status  e.g., 'paid', 'processing', 'completed', 'cancelled'
- * @param array  $payload     used for email placeholders
- */
+/** Update + emit status events */
 function wdss29_set_order_status( $order_id, $new_status, $payload = array() ) {
     global $wpdb;
     $order_id   = (int) $order_id;
@@ -138,51 +134,44 @@ function wdss29_set_order_status( $order_id, $new_status, $payload = array() ) {
     if ( ! $row ) return false;
 
     $old_status = (string) $row['status'];
-    if ( $old_status === $new_status ) {
-        // Nothing to do.
-        return true;
-    }
+    if ( $old_status === $new_status ) return true;
 
-    // Write status
     $table = wdss29_get_orders_table_name();
     $wpdb->update(
         $table,
-        array( 'status' => $new_status, 'updated_at' => current_time('mysql') ),
+        array( 'status' => $new_status, 'updated_at' => current_time( 'mysql' ) ),
         array( 'id' => $order_id ),
         array( '%s','%s' ),
         array( '%d' )
     );
 
-    // Build payload (fill gaps from order row)
-    $payload = array_merge(
-        array(
-            'customer_email' => $row['customer_email'] ?? '',
-            'customer_name'  => $row['customer_name'] ?? '',
-            'order_total'    => $row['total'] ?? 0,
-        ),
-        (array) $payload
-    );
+    $payload = wp_parse_args( (array)$payload, array(
+        'order_id'       => $order_id,
+        'order_number'   => $row['number'] ?: (string)$order_id,
+        'order_status'   => $new_status,
+        'order_subtotal' => (float)$row['subtotal'],
+        'order_tax'      => (float)$row['tax'],
+        'order_shipping' => (float)$row['shipping'],
+        'order_total'    => (float)$row['total'],
+        'currency'       => $row['currency'],
+        'payment_method' => $row['payment_method'],
+        'customer_email' => $row['customer_email'],
+        'customer_name'  => $row['customer_name'],
+        'items'          => $row['items'],
+        'created_at'     => $row['created_at'],
+        '_idem_key'      => 'order.status_changed|' . $order_id . '|' . $new_status,
+    ) );
 
-    // Ensure canonical keys present
-    $payload['order_status'] = $new_status;
-    $payload['order_id']     = $order_id;
-    $payload['site_name']    = $payload['site_name'] ?? get_bloginfo('name');
-    $payload['site_url']     = $payload['site_url']  ?? home_url('/');
-
-    // Existing internal hooks
     do_action( 'wdss29_order_status_changed', $order_id, $new_status, $payload );
-
-    // Bridge-friendly emits
     do_action( 'wdss_emit_order_event', 'status_changed', $order_id, $payload );
 
-    // NEW: Call the automation bus directly
-    do_action( 'wdss_email_trigger', 'order.status_changed', $order_id, $payload );
+    // Email Automations bus wants (event, payload)
+    do_action( 'wdss_email_trigger', 'order.status_changed', $payload );
 
-    // Common case: payment succeeded => 'paid'
     if ( $new_status === 'paid' ) {
         do_action( 'wdss29_order_paid', $order_id, $payload );
-        do_action( 'wdss_emit_order_event', 'paid', $order_id, $payload );            // bridge
-        do_action( 'wdss_email_trigger', 'order.paid', $order_id, $payload );        // direct bus
+        do_action( 'wdss_emit_order_event', 'paid', $order_id, $payload );
+        do_action( 'wdss_email_trigger', 'order.paid', $payload );
     }
 
     return true;
