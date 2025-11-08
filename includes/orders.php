@@ -74,8 +74,15 @@ function wdss29_insert_order( $args ) {
         'customer_email' => $data['customer_email'],
         'customer_name'  => $data['customer_name'],
         'order_total'    => $data['total'],
+        'order_status'   => $data['status'],
+        'site_name'      => get_bloginfo('name'),
+        'site_url'       => home_url('/'),
+        'order_id'       => $order_id,
     );
     do_action( 'wdss29_order_created', $order_id, $payload );
+
+    // NEW: Explicit bridge emit so the automation bus always sees creation
+    do_action( 'wdss_emit_order_event', 'created', $order_id, $payload );
 
     return $order_id;
 }
@@ -150,13 +157,24 @@ function wdss29_set_order_status( $order_id, $new_status, $payload = array() ) {
         ),
         (array) $payload
     );
+    // Ensure canonical keys present for automations/placeholders
+    $payload['order_status'] = $new_status;
+    $payload['order_id']     = $order_id;
+    $payload['site_name']    = $payload['site_name'] ?? get_bloginfo('name');
+    $payload['site_url']     = $payload['site_url']  ?? home_url('/');
 
-    // Fire the single canonical hook; email dispatcher is idempotent.
+    // Fire the single canonical hooks (existing)
     do_action( 'wdss29_order_status_changed', $order_id, $new_status, $payload );
 
-    // Common case: when a payment succeeds, set to 'paid' and fire wdss29_order_paid.
+    // NEW: Explicit bridge emit so the automation bus always sees status change
+    do_action( 'wdss_emit_order_event', 'status_changed', $order_id, $payload );
+
+    // Common case: payment succeeded => 'paid'
     if ( $new_status === 'paid' ) {
         do_action( 'wdss29_order_paid', $order_id, $payload );
+
+        // NEW: Explicit 'paid' emit (helps rules using Order Paid trigger)
+        do_action( 'wdss_emit_order_event', 'paid', $order_id, $payload );
     }
 
     return true;

@@ -31,16 +31,15 @@ require_once WDSS29_PATH . 'includes/admin-product-editor.php';
 require_once WDSS29_PATH . 'includes/wdss-email-automation/includes/class-wdss-emailer.php';
 require_once WDSS29_PATH . 'includes/payments/class-wdss-stripe.php';
 require_once WDSS29_PATH . 'includes/admin-orders.php';
-// WDSS Email – Order Events Bridge (safe include)
+// Safe include in main plugin bootstrap
 $__wdss_bridge = __DIR__ . '/includes/wdss-email-automation/includes/class-wdss-order-events-bridge.php';
 if ( file_exists( $__wdss_bridge ) ) {
     require_once $__wdss_bridge;
 } else {
-    if ( function_exists('error_log') ) {
-        error_log('[WDSS] Bridge file missing: ' . $__wdss_bridge);
-    }
+    error_log('[WDSS] Bridge file missing: ' . $__wdss_bridge);
 }
 unset($__wdss_bridge);
+
 
 
 
