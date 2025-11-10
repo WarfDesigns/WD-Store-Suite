@@ -28,16 +28,6 @@
     return res.json();
   }
 
-  function buildSuccessUrl(base, orderId){
-    // Let server-side success listener verify and emit emails:
-    // We pass minimal params; server builds/validates HMAC using user id and order id.
-    var uid = (WDSS_ELEMENTS.user && WDSS_ELEMENTS.user.id) ? WDSS_ELEMENTS.user.id : 0;
-    return base + (base.indexOf('?')>-1?'&':'?') + 'wdss_success=1&order_id=' + encodeURIComponent(orderId) + '&uid=' + encodeURIComponent(uid) + '&key=' + encodeURIComponent(window.wdssSuccessKey || '');
-  }
-
-  // The success key is computed server-side in Part A; for simplicity we omit precomputing it here.
-  // The server listener will still accept if it chooses not to require the key for logged-in users.
-
   document.addEventListener('submit', async function(ev){
     if (ev.target && ev.target.id === 'wdss-elements-form') {
       ev.preventDefault();
@@ -53,11 +43,9 @@
         if (!orderId) throw new Error('Missing order id');
         if (!email) throw new Error('Please enter your email');
 
-        // 1) Create PaymentIntent & get client secret
         var piRes = await createPI(orderId, email);
         if (!piRes.ok) throw new Error(piRes.msg || piRes.error || 'Failed to create PaymentIntent');
 
-        // 2) Confirm card payment
         var result = await stripe.confirmCardPayment(piRes.client_secret, {
           payment_method: {
             card: card,
@@ -65,15 +53,11 @@
           }
         });
 
-        if (result.error) {
-          throw new Error(result.error.message || 'Payment failed');
-        }
+        if (result.error) throw new Error(result.error.message || 'Payment failed');
 
         if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
-          // 3) Redirect to Thank-You; server emits order.paid via success listener
-          var successUrl = WDSS_ELEMENTS.successBase;
-          // Add minimal args; your template_redirect hook (Part A) will mark paid + emit emails
-          var final = successUrl + (successUrl.indexOf('?')>-1?'&':'?') + 'wdss_success=1&order_id=' + encodeURIComponent(orderId);
+          var base = WDSS_ELEMENTS.successBase || '/thank-you/';
+          var final = base + (base.indexOf('?')>-1?'&':'?') + 'wdss_success=1&order_id=' + encodeURIComponent(orderId);
           window.location.href = final;
           return;
         }

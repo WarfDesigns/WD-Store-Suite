@@ -1,6 +1,6 @@
 <?php
 /**
- * Stripe gateway — capture + post-payment event
+ * Stripe gateway — webhook: mark paid + emit emails (safe, idempotent)
  * Author: Warf Designs LLC
  */
 
@@ -40,7 +40,7 @@ class WDSS29_Stripe {
         return $cur;
     }
 
-    /** Extract useful customer/buyer hints from PI / Charge / Session. */
+    /** Extract useful customer hints from PI / Charge / Session. */
     private function extract_stripe_hints( $obj ) {
         $hints = array();
 
@@ -77,10 +77,7 @@ class WDSS29_Stripe {
         return $hints;
     }
 
-    /**
-     * Pull order_id from metadata on PI / Charge / Session or client_reference_id.
-     * Filter key with: add_filter('wdss29_stripe_order_meta_key', fn() => 'your_key');
-     */
+    /** Resolve local order id from Stripe payload */
     private function resolve_order_id( $payload_obj ) {
         $meta_key = apply_filters( 'wdss29_stripe_order_meta_key', 'order_id' );
 
@@ -103,7 +100,7 @@ class WDSS29_Stripe {
         return 0;
     }
 
-    /** Build the normalized email payload from DB + hints (minimal but complete). */
+    /** Build normalized email payload from DB + hints */
     private function build_email_payload( $order_id, $hints = array() ) {
         $payload = array(
             'order_id'       => (int) $order_id,
@@ -148,6 +145,7 @@ class WDSS29_Stripe {
         return $payload;
     }
 
+    /** REST webhook handler */
     public function handle_webhook( $request ) {
         $data = json_decode( $request->get_body(), true );
         if ( ! is_array( $data ) ) {
@@ -170,7 +168,7 @@ class WDSS29_Stripe {
             return new WP_REST_Response( array( 'ok' => true, 'note' => 'ignored_type' ), 200 );
         }
 
-        // Minimal trace that webhook is hitting
+        // Minimal trace that webhook hit
         do_action( 'wdss_email_trigger', 'order.debug', array(
             'note' => 'stripe_webhook_hit', 'type' => $type, 'obj_id' => $this->ap($obj, array('id'), '')
         ) );
@@ -191,14 +189,14 @@ class WDSS29_Stripe {
         // 2) Build hints (email/name)
         $hints = $this->extract_stripe_hints( $obj );
 
-        // 3) Mark PAID (your orders.php will emit order.paid)
+        // 3) Mark PAID (orders.php will emit order.paid)
         if ( function_exists( 'wdss29_set_order_status' ) ) {
             wdss29_set_order_status( $order_id, 'paid', $hints );
         } else {
             do_action( 'wdss29_order_paid', $order_id, $hints );
         }
 
-        // 4) Safety net: directly emit order.paid once (idempotent) — FIXED to pass order_id
+        // 4) Safety net: directly emit order.paid once — correct 3-arg call
         $idem_key = 'wdss_paid_sent_' . (int) $order_id;
         if ( ! get_transient( $idem_key ) ) {
             $payload = $this->build_email_payload( $order_id, $hints );
