@@ -1,6 +1,6 @@
 <?php
 /**
- * Stripe gateway — capture + post-payment event
+ * Stripe gateway — webhook: verify signature, mark paid, emit emails (idempotent)
  * Author: Warf Designs LLC
  */
 
@@ -40,7 +40,7 @@ class WDSS29_Stripe {
         return $cur;
     }
 
-    /** Extract useful customer/buyer hints from PI / Charge / Session. */
+    /** Extract useful customer hints from PI / Charge / Session. */
     private function extract_stripe_hints( $obj ) {
         $hints = array();
 
@@ -77,10 +77,7 @@ class WDSS29_Stripe {
         return $hints;
     }
 
-    /**
-     * Pull order_id from metadata on PI / Charge / Session or client_reference_id.
-     * Filter key with: add_filter('wdss29_stripe_order_meta_key', fn() => 'your_key');
-     */
+    /** Resolve local order id from Stripe payload */
     private function resolve_order_id( $payload_obj ) {
         $meta_key = apply_filters( 'wdss29_stripe_order_meta_key', 'order_id' );
 
@@ -103,7 +100,7 @@ class WDSS29_Stripe {
         return 0;
     }
 
-    /** Build the normalized email payload from DB + hints (minimal but complete). */
+    /** Build normalized email payload from DB + hints */
     private function build_email_payload( $order_id, $hints = array() ) {
         $payload = array(
             'order_id'       => (int) $order_id,
@@ -145,12 +142,51 @@ class WDSS29_Stripe {
             }
         }
 
-        // If still no email, as a last resort do NOT hard-fail; your rule may be admin-only.
         return $payload;
     }
 
+    /** REST webhook handler (with signature verification) */
     public function handle_webhook( $request ) {
-        $data = json_decode( $request->get_body(), true );
+        // ── 1) Try to verify the Stripe signature if a secret is configured ─────────
+        $data = null;
+
+        // Option 1: define in wp-config.php → define('WDSS29_STRIPE_WHSEC', 'whsec_...');
+        $secret = defined('WDSS29_STRIPE_WHSEC') ? WDSS29_STRIPE_WHSEC : '';
+
+        // Option 2: store in settings (wdss29_webhook_secret)
+        if ( empty( $secret ) ) {
+            $opt = get_option( 'wdss29_webhook_secret', '' );
+            if ( is_string( $opt ) && $opt !== '' ) {
+                $secret = $opt;
+            }
+        }
+
+        if ( ! empty( $secret ) && class_exists( '\Stripe\Webhook' ) ) {
+            $payload    = $request->get_body();
+            $sig_header = isset( $_SERVER['HTTP_STRIPE_SIGNATURE'] ) ? $_SERVER['HTTP_STRIPE_SIGNATURE'] : '';
+
+            try {
+                $event = \Stripe\Webhook::constructEvent( $payload, $sig_header, $secret );
+                // Convert \Stripe\Event to array for downstream code
+                if ( method_exists( $event, 'toJSON' ) ) {
+                    $data = json_decode( $event->toJSON(), true );
+                } else {
+                    $data = json_decode( json_encode( $event ), true );
+                }
+            } catch ( \Exception $e ) {
+                return new WP_REST_Response( array(
+                    'ok'    => false,
+                    'error' => 'bad_signature',
+                    'msg'   => $e->getMessage(),
+                ), 400 );
+            }
+        }
+
+        // Fallback if secret not set / Stripe SDK not loaded
+        if ( ! is_array( $data ) ) {
+            $data = json_decode( $request->get_body(), true );
+        }
+
         if ( ! is_array( $data ) ) {
             return new WP_REST_Response( array( 'ok' => false, 'error' => 'invalid_payload' ), 400 );
         }
@@ -158,7 +194,7 @@ class WDSS29_Stripe {
         $type = $data['type'] ?? '';
         $obj  = $this->ap( $data, array('data','object'), array() );
 
-        // Accept multiple "paid" signals
+        // ── 2) Accept multiple "paid" signals ───────────────────────────────────────
         $supported = array(
             'payment_intent.succeeded',
             'checkout.session.completed',
@@ -171,12 +207,12 @@ class WDSS29_Stripe {
             return new WP_REST_Response( array( 'ok' => true, 'note' => 'ignored_type' ), 200 );
         }
 
-        // Minimal trace that webhook is hitting
+        // Trace webhook hit (helps diagnose)
         do_action( 'wdss_email_trigger', 'order.debug', array(
             'note' => 'stripe_webhook_hit', 'type' => $type, 'obj_id' => $this->ap($obj, array('id'), '')
         ) );
 
-        // 1) Resolve local order
+        // ── 3) Resolve local order ─────────────────────────────────────────────────
         $order_id = $this->resolve_order_id( $obj );
         if ( $order_id <= 0 ) {
             do_action( 'wdss_email_trigger', 'order.debug', array(
@@ -189,32 +225,31 @@ class WDSS29_Stripe {
             return new WP_REST_Response( array( 'ok' => true, 'note' => 'no_order_link' ), 200 );
         }
 
-        // 2) Build hints (email/name)
+        // ── 4) Build hints (email/name) and mark paid ──────────────────────────────
         $hints = $this->extract_stripe_hints( $obj );
 
-        // 3) Mark PAID (your orders.php should emit order.paid)
         if ( function_exists( 'wdss29_set_order_status' ) ) {
             wdss29_set_order_status( $order_id, 'paid', $hints );
         } else {
             do_action( 'wdss29_order_paid', $order_id, $hints );
         }
 
-        // 4) Safety net: directly emit order.paid once (idempotent)
+        // ── 5) Safety net: emit order.paid exactly once (correct 3-arg call) ──────
         $idem_key = 'wdss_paid_sent_' . (int) $order_id;
         if ( ! get_transient( $idem_key ) ) {
             $payload = $this->build_email_payload( $order_id, $hints );
-            do_action( 'wdss_email_trigger', 'order.paid', $payload );
+            do_action( 'wdss_email_trigger', 'order.paid', (int) $order_id, $payload );
 
             do_action( 'wdss_email_trigger', 'order.debug', array(
-                'note' => 'order_paid_emitted_direct',
-                'order_id' => (int) $order_id,
-                'has_email' => !empty($payload['customer_email']),
+                'note'      => 'order_paid_emitted_direct',
+                'order_id'  => (int) $order_id,
+                'has_email' => ! empty( $payload['customer_email'] ),
             ));
 
             set_transient( $idem_key, 1, 10 * MINUTE_IN_SECONDS );
         }
 
-        // 5) Wake the poller so queued sends go out right away
+        // ── 6) Wake the poller so queued sends go out right away ───────────────────
         if ( function_exists( 'wp_schedule_single_event' ) ) {
             wp_schedule_single_event( time() + 5, 'wdss_email_order_poller_tick' );
         }

@@ -3,6 +3,14 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 
 if ( ! function_exists('wdss29_render_checkout_session_page') ) {
     function wdss29_render_checkout_session_page() {
+        // Ensure no output before headers
+        if ( function_exists('ob_get_level') && ob_get_level() > 0 ) {
+            while ( ob_get_level() ) { @ob_end_clean(); }
+        }
+
+        // Disallow caching
+        nocache_headers();
+
         if ( ! is_user_logged_in() ) wp_die( 'Please log in to continue.' );
 
         $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
@@ -12,23 +20,35 @@ if ( ! function_exists('wdss29_render_checkout_session_page') ) {
         $order = wdss29_get_order( $order_id );
         if ( ! is_array($order) ) wp_die( 'Order not found.' );
 
-        $settings = get_option('wdss29_settings', array());
-        $stripe_sk = isset($settings['stripe_sk']) ? trim($settings['stripe_sk']) : '';
+        $settings   = get_option('wdss29_settings', array());
+        $stripe_sk  = isset($settings['stripe_sk']) ? trim($settings['stripe_sk']) : '';
         if ( empty($stripe_sk) ) wp_die( 'Stripe secret key missing in settings.' );
 
-        $currency = ! empty($order['currency']) ? strtolower($order['currency']) : 'usd';
+        $currency   = ! empty($order['currency']) ? strtolower($order['currency']) : 'usd';
 
-        $thankyou_page_id = isset($settings['thankyou_page_id']) ? absint($settings['thankyou_page_id']) : 0;
-        $cancel_page_id   = isset($settings['cancel_page_id'])   ? absint($settings['cancel_page_id'])   : 0;
+        // Your site uses /regiss/checkout-success/ and wdss29=success
+        // If you prefer to use a setting, swap this for a get_permalink($thankyou_page_id)
+        $base_success = home_url('/regiss/checkout-success/');
+        $cancel_url   = home_url('/regiss/cart/');
 
-        $base_success = $thankyou_page_id ? get_permalink($thankyou_page_id) : home_url('/thank-you/');
-        $cancel_url   = $cancel_page_id   ? get_permalink($cancel_page_id)   : home_url('/cart/');
+        $user_id = get_current_user_id();
 
-        $user_id     = get_current_user_id();
-        $success_url = function_exists('wdss29_build_success_url')
-            ? wdss29_build_success_url( $base_success, $order_id, $user_id )
-            : add_query_arg( array( 'wdss_success' => 1, 'order_id' => (int)$order_id ), $base_success );
+        // Signed key (so your success catcher can mark order paid)
+        if ( function_exists('wdss29_build_success_key') ) {
+            $signed_key = wdss29_build_success_key( $order_id, $user_id );
+        } else {
+            $signed_key = hash_hmac( 'sha256', (int)$order_id . '|' . (int)$user_id, wp_salt('auth') );
+        }
 
+        // IMPORTANT: Build success URL MANUALLY so {CHECKOUT_SESSION_ID} is NOT encoded.
+        // Keep your wdss29=success param (this matches your page)
+        $success_url = rtrim($base_success, '/') . '/?wdss29=success'
+            . '&order_id=' . (int)$order_id
+            . '&uid=' . (int)$user_id
+            . '&key=' . rawurlencode($signed_key)
+            . '&session_id={CHECKOUT_SESSION_ID}';
+
+        // Build line items
         $items = array();
         $raw_items = isset($order['items']) ? (is_array($order['items']) ? $order['items'] : maybe_unserialize($order['items'])) : array();
         if ( is_array($raw_items) && ! empty($raw_items) ) {
@@ -49,6 +69,8 @@ if ( ! function_exists('wdss29_render_checkout_session_page') ) {
                 );
             }
         }
+
+        // Fallback single line if no detailed items came through
         if ( empty($items) ) {
             $total_cents = (int) round( (float)$order['total'] * 100 );
             if ( $total_cents <= 0 ) wp_die( 'Order total is zero; nothing to charge.' );
@@ -62,6 +84,7 @@ if ( ! function_exists('wdss29_render_checkout_session_page') ) {
             );
         }
 
+        // Customer email if known
         $customer_email = ! empty($order['customer_email']) ? sanitize_email($order['customer_email']) : '';
         if ( ! $customer_email && is_email( wp_get_current_user()->user_email ) ) {
             $customer_email = wp_get_current_user()->user_email;
@@ -71,22 +94,31 @@ if ( ! function_exists('wdss29_render_checkout_session_page') ) {
         \Stripe\Stripe::setApiKey( $stripe_sk );
 
         try {
-            $session = \Stripe\Checkout\Session::create(array(
+            $params = array(
                 'mode'        => 'payment',
                 'line_items'  => $items,
-                'success_url' => $success_url, // signed URL
+                'success_url' => $success_url, // includes {CHECKOUT_SESSION_ID} + wdss29=success
                 'cancel_url'  => $cancel_url,
-                'metadata' => array('order_id' => (string) $order_id),
+                'metadata'    => array('order_id' => (string) $order_id),
                 'client_reference_id' => (string) $order_id,
                 'payment_intent_data' => array(
-                    'metadata'      => array( 'order_id' => (string) $order_id ),
-                    'receipt_email' => $customer_email,
+                    'metadata' => array( 'order_id' => (string) $order_id ),
                 ),
-                'customer_email' => $customer_email ?: null,
-            ));
+            );
+            if ( $customer_email ) {
+                $params['customer_email'] = $customer_email;
+                $params['payment_intent_data']['receipt_email'] = $customer_email;
+            }
 
+            $session = \Stripe\Checkout\Session::create( $params );
+
+            // DEBUG: log both URLs so you can verify what's actually sent to Stripe
+            error_log('[WDSS] success_url sent to Stripe: ' . $success_url);
+            error_log('[WDSS] session->url from Stripe: ' . $session->url);
+
+            // You MUST go to Stripe (stripe.com/checkout) so Stripe can replace the placeholder.
             if ( ! headers_sent() ) {
-                wp_redirect( $session->url, 302 );
+                wp_safe_redirect( $session->url, 302 );
                 exit;
             } else {
                 echo '<script>window.location.href='.json_encode($session->url).';</script>';

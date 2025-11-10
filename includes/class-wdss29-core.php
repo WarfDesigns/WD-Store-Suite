@@ -29,8 +29,10 @@ class WDSS29_Core {
 
         // Make sure the poller is scheduled (no activation hook from include files)
         add_action( 'init', array( $this, 'maybe_schedule_poller' ) );
+        // Backstop: reschedule while in admin too
+        add_action( 'admin_init', array( $this, 'maybe_schedule_poller' ) );
 
-        // Poller callback (defensive: only runs if something registered it)
+        // Poller callback
         add_action( 'wdss_email_order_poller_tick', array( $this, 'order_poller_tick' ) );
     }
 
@@ -66,20 +68,27 @@ class WDSS29_Core {
 
     /** Schedule the poller if not present (safe to run on every init) */
     public function maybe_schedule_poller() {
+        // Ensure our schedule exists before scheduling
+        // (the filter above already added it for this request)
         if ( ! wp_next_scheduled( 'wdss_email_order_poller_tick' ) ) {
-            // Make sure our schedule exists before scheduling
-            $schedules = wp_get_schedules();
-            $recurrence = isset( $schedules['wdss_minutely'] ) ? 'wdss_minutely' : 'minute'; // fallback if needed
-            if ( $recurrence === 'wdss_minutely' ) {
-                wp_schedule_event( time() + 60, 'wdss_minutely', 'wdss_email_order_poller_tick' );
-            }
+            wp_schedule_event( time() + 60, 'wdss_minutely', 'wdss_email_order_poller_tick' );
         }
     }
 
-    /** Optional: poller to catch delayed emails (defensive no-ops) */
+    /** Poller tick handler */
     public function order_poller_tick() {
-        // If you have a queue/backfill system, call it here. Keep it no-op if not used.
-        // This prevents cron from rescheduling with a missing schedule.
+        // Optional: log a heartbeat for debugging
+        do_action( 'wdss_email_trigger', 'order.debug', array(
+            'note' => 'poller_tick',
+            'time' => current_time( 'mysql' ),
+        ) );
+
+        // If you have a queue/backfill system, run it here
+        if ( function_exists( 'wdss29_process_email_queue' ) ) {
+            wdss29_process_email_queue();
+        }
+
+        // Also allow other listeners to hook a "run" tick if needed
         do_action( 'wdss_email_order_poller_tick_run' );
     }
 }
@@ -89,8 +98,30 @@ endif;
 // Bootstrap
 WDSS29_Core::instance();
 
+/**
+ * Optional: clear the schedule on plugin deactivation.
+ * Keep this here since we're inside /includes/ and not the main file.
+ * Adjust the main file name if yours differs.
+ */
+if ( ! function_exists( 'wdss29_clear_email_poller' ) ) {
+    function wdss29_clear_email_poller() {
+        $timestamp = wp_next_scheduled( 'wdss_email_order_poller_tick' );
+        if ( $timestamp ) {
+            wp_unschedule_event( $timestamp, 'wdss_email_order_poller_tick' );
+        }
+        wp_clear_scheduled_hook( 'wdss_email_order_poller_tick' );
+    }
+
+    // Ensure this path matches your main plugin file exactly:
+    register_deactivation_hook(
+        plugin_basename( dirname( __FILE__, 2 ) . '/wd-store-suite-v2_9.php' ),
+        'wdss29_clear_email_poller'
+    );
+}
+
 /* --------------------------------------------------------------------------
  * Email payload + normalized dispatcher helpers
+ * (LEFT AS-IS from your version)
  * -------------------------------------------------------------------------- */
 
 if ( ! function_exists('wdss29_get_meta') ) {
@@ -209,7 +240,7 @@ if ( ! function_exists('wdss29_emit_order_paid') ) {
     function wdss29_emit_order_paid( $order_id, $hints = array() ) {
         $payload = wdss29_build_email_payload( $order_id, (array)$hints );
 
-        // Email Automations bus (correct 2-arg signature)
+        // Email Automations bus (kept with your 2-arg signature)
         do_action( 'wdss_email_trigger', 'order.paid', $payload );
 
         // Optional back-compat
@@ -222,7 +253,7 @@ if ( ! function_exists('wdss29_emit_order_status_changed') ) {
         $payload['order_status'] = (string) $new_status;
         $payload['_idem_key'] = 'order.status_changed|' . $order_id . '|' . $new_status;
 
-        // Email Automations bus (correct 2-arg signature)
+        // Email Automations bus (kept with your 2-arg signature)
         do_action( 'wdss_email_trigger', 'order.status_changed', $payload );
 
         // Optional back-compat
