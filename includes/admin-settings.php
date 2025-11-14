@@ -1,9 +1,9 @@
-<?php
+<?php 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
 /**
  * WD Store Settings
- * - Stripe keys (secret, publishable, webhook signing secret)
+ * - Stripe keys
  * - Sales Tax / Card Processing Fee
  * - Add-on Prices (Back, 3" Front Length, 12" Train)
  */
@@ -27,9 +27,8 @@ function wdss29_settings_defaults() {
     return array(
         'stripe_sk'       => '',
         'stripe_pk'       => '',
-        'stripe_whsec'    => '', // NEW: Webhook signing secret
-        'sales_tax_rate'  => 6,  // %
-        'card_fee_rate'   => 3,  // %
+        'sales_tax_rate'  => 6, // %
+        'card_fee_rate'   => 3, // %
         // Add-on prices (USD) — per unit
         'addon_prices'    => array(
             'back_zip_up'   => 0.00,
@@ -65,9 +64,8 @@ function wdss29_render_settings_page() {
         $new = $settings;
 
         // Stripe keys
-        $new['stripe_sk']    = sanitize_text_field( $_POST['stripe_sk']    ?? '' );
-        $new['stripe_pk']    = sanitize_text_field( $_POST['stripe_pk']    ?? '' );
-        $new['stripe_whsec'] = sanitize_text_field( $_POST['stripe_whsec'] ?? '' ); // NEW
+        $new['stripe_sk'] = sanitize_text_field( $_POST['stripe_sk'] ?? '' );
+        $new['stripe_pk'] = sanitize_text_field( $_POST['stripe_pk'] ?? '' );
 
         // Rates (clamped 0–100)
         $sales = isset($_POST['sales_tax_rate']) ? floatval($_POST['sales_tax_rate']) : $settings['sales_tax_rate'];
@@ -100,9 +98,6 @@ function wdss29_render_settings_page() {
     }
 
     $ap = $settings['addon_prices'];
-
-    // Compute webhook endpoint for display
-    $webhook_endpoint = home_url( '/wp-json/wdss/v1/stripe' );
     ?>
     <div class="wrap">
         <h1>WD Store Settings</h1>
@@ -124,16 +119,6 @@ function wdss29_render_settings_page() {
                         <td>
                             <input id="wdss29_stripe_pk" type="text" name="stripe_pk" value="<?php echo esc_attr($settings['stripe_pk']); ?>" size="60">
                             <p class="description">Format: <code>pk_test_…</code> or <code>pk_live_…</code></p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><label for="wdss29_stripe_whsec">Webhook Signing Secret</label></th>
-                        <td>
-                            <input id="wdss29_stripe_whsec" type="text" name="stripe_whsec" value="<?php echo esc_attr($settings['stripe_whsec']); ?>" size="60" placeholder="whsec_...">
-                            <p class="description">Get this from Stripe: <strong>Developers → Webhooks →</strong> select your endpoint → <strong>Signing secret</strong>.</p>
-                            <p class="description"><strong>Webhook endpoint URL:</strong><br>
-                                <input type="text" readonly class="regular-text code" value="<?php echo esc_attr( $webhook_endpoint ); ?>" onclick="this.select();">
-                            </p>
                         </td>
                     </tr>
                 </tbody>
@@ -179,7 +164,7 @@ function wdss29_render_settings_page() {
                         </td>
                     </tr>
                     <tr>
-                        <th scope="row">Additional 3&quot; Front Length?</th>
+                        <th scope="row">Additional 3" Front Length?</th>
                         <td>
                             <label style="display:inline-block;margin-right:18px;">
                                 Yes:
@@ -192,7 +177,7 @@ function wdss29_render_settings_page() {
                         </td>
                     </tr>
                     <tr>
-                        <th scope="row">Additional 12&quot; Train Length?</th>
+                        <th scope="row">Additional 12" Train Length?</th>
                         <td>
                             <label style="display:inline-block;margin-right:18px;">
                                 Yes:

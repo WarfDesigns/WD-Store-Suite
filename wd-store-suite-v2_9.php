@@ -17,23 +17,18 @@ define( 'WDSS29_VERSION', '2.9' );
 
 // Core includes
 require_once WDSS29_PATH . 'includes/class-wdss29-core.php';
-require_once WDSS29_PATH . 'includes/class-wdss29-email-templates.php';
-
 require_once WDSS29_PATH . 'includes/cart.php';
 require_once WDSS29_PATH . 'includes/products.php';
 require_once WDSS29_PATH . 'includes/orders.php';
+require_once WDSS29_PATH . 'includes/email-templates.php';
 require_once WDSS29_PATH . 'includes/admin-settings.php';
 require_once WDSS29_PATH . 'includes/shortcodes.php';
 require_once WDSS29_PATH . 'includes/admin-import-export.php';
 require_once WDSS29_PATH . 'includes/admin-product-editor.php';
 require_once WDSS29_PATH . 'includes/payments/class-wdss-stripe.php';
-require_once WDSS29_PATH . 'includes/payments/class-wdss-stripe-webhook.php';
-require_once WDSS29_PATH . 'includes/payments/page-checkout-success.php';
 require_once WDSS29_PATH . 'includes/admin-orders.php';
 require_once WDSS29_PATH . 'includes/wdss-email-automation/includes/order-poller.php';
-
-// NO separate page-checkout-success.php needed if core has the handlers.
-
+require_once WDSS29_PATH . 'includes/admin/debug-view-logs.php';
 
 
 // Email automation (bridge + forwarders + engine)
@@ -62,7 +57,7 @@ add_filter('template_include', function( $template ) {
 }, 50);
 
 // If this slug is correct for your parent menu, keep it:
-add_filter('wdss_admin_parent_slug', function(){ return 'wd-store-suite'; });
+add_filter('wdss_admin_parent_slug', function(){ return 'wd-store-suite-v4_2'; });
 
 // Admin assets
 add_action( 'admin_enqueue_scripts', function() {
@@ -85,18 +80,3 @@ register_activation_hook( __FILE__, function() {
 register_deactivation_hook( __FILE__, function() {
     flush_rewrite_rules();
 });
-
-// --- WDSS: safe mail defaults (From/Name + HTML) ---
-add_filter('wp_mail_from', function($email){
-    // Use a real mailbox on your domain; MUST exist and match your SMTP "from"
-    return 'no-reply@warfdesigns.com';
-}, 20);
-
-add_filter('wp_mail_from_name', function($name){
-    return 'Warf Designs';
-}, 20);
-
-add_filter('wp_mail_content_type', function($type){
-    // Force HTML so template bodies render correctly
-    return 'text/html';
-}, 20);

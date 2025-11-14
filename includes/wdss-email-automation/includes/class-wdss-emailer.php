@@ -570,8 +570,26 @@ class WDSS_Emailer {
         $matched_any = false;
 
         foreach ( $rules as $idx => $rule ) {
-            if ( empty( $rule['enabled'] ) ) continue;
-            if ( ($rule['trigger'] ?? '') !== $event_key ) continue;
+            if ( empty( $rule['enabled'] ) ) {
+                $this->log_event( 'rule-skipped', array( 'rule' => $rule['name'] ?? '', 'reason' => 'disabled' ) );
+                continue;
+            }
+            if ( ($rule['trigger'] ?? '') !== $event_key ) {
+                $this->log_event( 'rule-skipped', array( 
+                    'rule' => $rule['name'] ?? '', 
+                    'reason' => 'trigger_mismatch',
+                    'rule_trigger' => $rule['trigger'] ?? '',
+                    'event_key' => $event_key
+                ) );
+                continue;
+            }
+            
+            $this->log_event( 'rule-matched', array( 
+                'rule' => $rule['name'] ?? '',
+                'rule_idx' => $idx,
+                'template_id' => $rule['template_id'] ?? 0,
+                'conditions' => $rule['conditions'] ?? ''
+            ) );
 
             if ( ! $this->check_conditions( $rule, $payload, $object_id ) ) {
                 $this->log_event( 'skip-conditions', array( 'rule' => $rule['name'] ?? '' ) );
@@ -722,6 +740,16 @@ class WDSS_Emailer {
         $conds = $rule['conditions'] ?? array();
         if ( empty( $conds ) ) return true;
         if ( is_string( $conds ) ) $conds = array_map( 'trim', explode( ',', $conds ) );
+        
+        // Log conditions check for debugging
+        $this->log_event( 'checking-conditions', array(
+            'rule' => $rule['name'] ?? '',
+            'conditions' => $conds,
+            'payload_keys' => array_keys( $payload ),
+            'order_status' => $payload['order_status'] ?? 'missing',
+            'order_total' => $payload['order_total'] ?? 'missing',
+        ));
+        
         foreach ( $conds as $cond ) {
             $cond = trim( $cond );
             if ( $cond === '' ) continue;
@@ -729,11 +757,28 @@ class WDSS_Emailer {
             if ( strpos( $cond, '=' ) !== false ) {
                 list( $key, $val ) = array_map( 'trim', explode( '=', $cond, 2 ) );
                 $in = isset( $payload[ $key ] ) ? (string) $payload[ $key ] : '';
-                if ( strval( $in ) !== $val ) return false;
+                if ( strval( $in ) !== $val ) {
+                    $this->log_event( 'condition-failed', array(
+                        'rule' => $rule['name'] ?? '',
+                        'condition' => $cond,
+                        'expected' => $val,
+                        'actual' => $in,
+                        'key' => $key,
+                    ));
+                    return false;
+                }
             } elseif ( strpos( $cond, 'min_total:' ) === 0 ) {
                 $min = (float) trim( substr( $cond, strlen('min_total:') ) );
                 $tot = isset( $payload['order_total'] ) ? (float) $payload['order_total'] : 0;
-                if ( $tot < $min ) return false;
+                if ( $tot < $min ) {
+                    $this->log_event( 'condition-failed', array(
+                        'rule' => $rule['name'] ?? '',
+                        'condition' => $cond,
+                        'min_required' => $min,
+                        'actual_total' => $tot,
+                    ));
+                    return false;
+                }
             }
         }
         return true;
