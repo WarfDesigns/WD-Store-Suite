@@ -105,8 +105,8 @@ function wdss29_create_order( $args ) {
     do_action( 'wdss29_order_created', $order_id, $payload );
     do_action( 'wdss_emit_order_event', 'created', $order_id, $payload );
 
-    // IMPORTANT: Email Automations bus wants (event, payload)
-    do_action( 'wdss_email_trigger', 'order.created', $payload );
+    // FIXED: Email Automations bus wants (event_key, object_id, payload)
+    do_action( 'wdss_email_trigger', 'order.created', $order_id, $payload );
 
     return $order_id;
 }
@@ -165,61 +165,14 @@ function wdss29_set_order_status( $order_id, $new_status, $payload = array() ) {
     do_action( 'wdss29_order_status_changed', $order_id, $new_status, $payload );
     do_action( 'wdss_emit_order_event', 'status_changed', $order_id, $payload );
 
-    // Email Automations bus wants (event, payload)
-    do_action( 'wdss_email_trigger', 'order.status_changed', $payload );
+    // FIXED: Email Automations bus wants (event_key, object_id, payload)
+    do_action( 'wdss_email_trigger', 'order.status_changed', $order_id, $payload );
 
     if ( $new_status === 'paid' ) {
         do_action( 'wdss29_order_paid', $order_id, $payload );
         do_action( 'wdss_emit_order_event', 'paid', $order_id, $payload );
-        do_action( 'wdss_email_trigger', 'order.paid', $payload );
+        do_action( 'wdss_email_trigger', 'order.paid', $order_id, $payload );
     }
 
     return true;
 }
-
-if ( ! defined('ABSPATH') ) exit;
-
-/**
- * Mark order status with logging + single-fire protections.
- * Expects orders to be a CPT (post) with _wdss_status meta.
- */
-if ( ! function_exists('wdss29_set_order_status') ) {
-    function wdss29_set_order_status( $order_id, $new_status, $hints = array() ) {
-        $order_id   = (int) $order_id;
-        $new_status = sanitize_text_field( $new_status );
-        $hints      = is_array($hints) ? $hints : array();
-
-        if ( ! $order_id || ! $new_status ) return false;
-
-        $prev = get_post_meta( $order_id, '_wdss_status', true );
-        if ( $prev === $new_status ) {
-            error_log('[WDSS] wdss29_set_order_status: no change for order ' . $order_id . ' (already ' . $new_status . ')');
-            return true;
-        }
-
-        update_post_meta( $order_id, '_wdss_status', $new_status );
-        do_action( 'wdss29_order_status_changed', $order_id, $prev, $new_status, $hints );
-
-        error_log('[WDSS] wdss29_set_order_status: order ' . $order_id . ' ' . $prev . ' -> ' . $new_status . ' via ' . ( $hints['source'] ?? 'unknown' ));
-        return true;
-    }
-}
-
-/**
- * When order becomes paid, emit the normalized event used by the email engine.
- */
-add_action( 'wdss29_order_status_changed', function( $order_id, $old, $new, $hints ){
-    if ( $new === 'paid' ) {
-        if ( function_exists('wdss29_emit_order_paid') ) {
-            wdss29_emit_order_paid( (int)$order_id, $hints );
-        } else {
-            $payload = array(
-                'order_id'     => (int)$order_id,
-                'order_status' => 'paid',
-                '_idem_key'    => 'order.paid|' . (int)$order_id,
-            );
-            do_action( 'wdss_email_trigger', 'order.paid', $payload );
-        }
-        error_log('[WDSS] order.paid emitted for ' . (int)$order_id . ' (source=' . ( $hints['source'] ?? 'unknown' ) . ')');
-    }
-}, 10, 4);

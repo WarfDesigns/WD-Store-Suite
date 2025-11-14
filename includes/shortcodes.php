@@ -90,9 +90,12 @@ if ( ! function_exists('wdss29_get_order_items_table_columns') ) {
     }
 }
 
-/** Create/upgrade orders table (adds tracking_id) */
-if ( ! function_exists('wdss29_maybe_install_or_upgrade_orders_table') ) {
-    function wdss29_maybe_install_or_upgrade_orders_table() {
+/** Create/upgrade wd_orders table (adds tracking_id and meta)
+ * NOTE: This is for wp_wd_orders table used by checkout flow
+ * Different from wp_wdss29_orders table in orders.php
+ */
+if ( ! function_exists('wdss29_maybe_install_or_upgrade_wd_orders_table') ) {
+    function wdss29_maybe_install_or_upgrade_wd_orders_table() {
         global $wpdb;
         $table = $wpdb->prefix . 'wd_orders';
 
@@ -119,6 +122,29 @@ if ( ! function_exists('wdss29_maybe_install_or_upgrade_orders_table') ) {
         ) {$charset_collate};";
 
         dbDelta($sql);
+        
+        // dbDelta() is unreliable for adding columns to existing tables
+        // Manually check and add missing columns
+        $cols = wdss29_get_orders_table_columns();
+        
+        // Check for tracking_id column
+        if ( ! isset($cols['tracking_id']) ) {
+            $result = $wpdb->query("ALTER TABLE {$table} ADD COLUMN tracking_id VARCHAR(191) NOT NULL DEFAULT ''");
+            if ( $result !== false ) {
+                $wpdb->query("CREATE INDEX idx_tracking_id ON {$table} (tracking_id)");
+                wdss29_log('orders_table_upgrade', array('added' => 'tracking_id'));
+            }
+        }
+        
+        // Check for meta column (CRITICAL for order lookup)
+        if ( ! isset($cols['meta']) ) {
+            $result = $wpdb->query("ALTER TABLE {$table} ADD COLUMN meta LONGTEXT NULL");
+            if ( $result !== false ) {
+                wdss29_log('orders_table_upgrade', array('added' => 'meta'));
+            } else {
+                wdss29_log('orders_table_upgrade', array('error' => 'failed_to_add_meta', 'mysql_error' => $wpdb->last_error));
+            }
+        }
     }
 }
 
@@ -196,7 +222,7 @@ if ( ! function_exists('wdss29_save_order') ) {
     function wdss29_save_order( $args ) {
         global $wpdb;
 
-        wdss29_maybe_install_or_upgrade_orders_table();
+        wdss29_maybe_install_or_upgrade_wd_orders_table();
 
         $cols       = wdss29_get_orders_table_columns();
         $table      = $wpdb->prefix . 'wd_orders';
@@ -723,7 +749,7 @@ add_action('init', function() {
     wdss29_log('checkout_v2:start');
 
     // Ensure tables
-    wdss29_maybe_install_or_upgrade_orders_table();
+    wdss29_maybe_install_or_upgrade_wd_orders_table();
     wdss29_maybe_install_or_upgrade_order_items_table();
 
     $s = wdss29_get_settings();
@@ -826,15 +852,16 @@ add_action('init', function() {
         );
     }
 
-    $success_url = add_query_arg(
-        array('wdss29' => 'success', 'session_id' => '{CHECKOUT_SESSION_ID}'),
-        home_url('/checkout-success/')
-    );
+    // CRITICAL: Build success_url manually to preserve {CHECKOUT_SESSION_ID} placeholder
+    // Do NOT use esc_url_raw() as it will encode the braces and Stripe won't replace it!
+    $success_base = home_url('/checkout-success/');
+    $success_url = rtrim($success_base, '/') . '/?wdss29=success&session_id={CHECKOUT_SESSION_ID}';
+    
     $cancel_url  = add_query_arg(array('wdss29' => 'cancel'), wp_get_referer() ?: home_url('/'));
 
     $body = array(
         'mode'                 => 'payment',
-        'success_url'          => esc_url_raw($success_url),
+        'success_url'          => $success_url,  // Already a valid URL, don't escape
         'cancel_url'           => esc_url_raw($cancel_url),
         'client_reference_id'  => $client_ref,
         'metadata'             => array(
@@ -884,6 +911,7 @@ add_action('init', function() {
 
 /** =====================================================================
  *  V2 Success (promote pending->paid + ensure items)
+ *  FIXED: Now uses correct wdss29_orders table and triggers email automation
  * ===================================================================== */
 add_action('init', function () {
     if ( empty($_GET['wdss29']) || $_GET['wdss29'] !== 'success' ) return;
@@ -912,24 +940,67 @@ add_action('init', function () {
     $client_ref   = (string) ($json['client_reference_id'] ?? '');
     $amount_total = isset($json['amount_total']) && is_numeric($json['amount_total']) ? round(((int)$json['amount_total'])/100, 2) : 0.0;
 
+    // Get customer details from Stripe
+    $cust_email = '';
+    $cust_name  = '';
+    if (!empty($json['customer_details']) && is_array($json['customer_details'])) {
+        $cust_email = sanitize_email($json['customer_details']['email'] ?? '');
+        $cust_name  = sanitize_text_field($json['customer_details']['name'] ?? '');
+    }
+
+    $uid = 0;
+    $u   = wp_get_current_user();
+    if ($u && $u->ID) $uid = (int) $u->ID;
+
+    // NOTE: checkout flow uses wd_orders table, not wdss29_orders
     global $wpdb;
     $table = $wpdb->prefix . 'wd_orders';
     $cols  = wdss29_get_orders_table_columns();
+    
+    wdss29_log('success_v2:table_columns_detected', array(
+        'table' => $table,
+        'has_meta_column' => isset($cols['meta']),
+        'all_columns' => array_keys($cols)
+    ));
 
-    // Already paid by this payment_id? (de-dupe is also below at priority 7)
-    $dup = (int) $wpdb->get_var( $wpdb->prepare(
-        "SELECT COUNT(*) FROM {$table} WHERE payment_id=%s AND status='paid' LIMIT 1",
-        $session_id
-    ) );
-    if ( $dup > 0 ) {
-        if ( function_exists('wdss29_empty_cart') ) wdss29_empty_cart();
-        wp_safe_redirect( home_url('/checkout-success/') );
-        exit;
+    // Check for duplicate payment
+    if ( ! empty($session_id) ) {
+        $dup = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table} WHERE payment_id=%s AND status='paid' LIMIT 1",
+            $session_id
+        ) );
+        if ( $dup > 0 ) {
+            wdss29_log('success_v2:already_paid_duplicate');
+            if ( function_exists('wdss29_empty_cart') ) wdss29_empty_cart();
+            wp_safe_redirect( home_url('/checkout-success/') );
+            exit;
+        }
     }
 
-    // Find pending by meta client_reference_id
+    // Find pending order by client_reference_id in meta
     $order_row = null;
     if ( $client_ref !== '' && isset($cols['meta']) ) {
+        // Debug: Check what pending orders exist
+        $pending_orders = $wpdb->get_results(
+            "SELECT id, customer_id, total, meta, created_at FROM {$table} WHERE status = 'pending' ORDER BY id DESC LIMIT 5",
+            ARRAY_A
+        );
+        wdss29_log('success_v2:pending_orders_check', array(
+            'client_ref_searching_for' => $client_ref,
+            'pending_count' => count($pending_orders),
+            'recent_orders' => array_map(function($o) { 
+                return array(
+                    'id' => $o['id'], 
+                    'customer_id' => $o['customer_id'],
+                    'total' => $o['total'],
+                    'meta_snippet' => substr($o['meta'] ?? '', 0, 200)
+                ); 
+            }, $pending_orders)
+        ));
+        
+        $search_pattern = '%' . $wpdb->esc_like( '"client_reference_id":"' . $client_ref . '"' ) . '%';
+        wdss29_log('success_v2:search_pattern', array('pattern' => $search_pattern));
+        
         $order_row = $wpdb->get_row(
             $wpdb->prepare(
                 "SELECT * FROM {$table}
@@ -937,18 +1008,56 @@ add_action('init', function () {
                  AND meta LIKE %s
                  ORDER BY id DESC
                  LIMIT 1",
-                '%' . $wpdb->esc_like( '"client_reference_id":"' . $client_ref . '"' ) . '%'
+                $search_pattern
             ),
             ARRAY_A
         );
+        
+        wdss29_log('success_v2:meta_search_result', array('found' => !empty($order_row), 'order_id' => $order_row['id'] ?? null));
+    } else {
+        wdss29_log('success_v2:meta_search_skipped', array(
+            'reason' => !isset($cols['meta']) ? 'meta_column_missing' : 'no_client_ref',
+            'client_ref' => $client_ref
+        ));
+    }
+    
+    // Fallback: If meta search failed, try to find most recent pending order for this user
+    if ( ! $order_row && $uid > 0 ) {
+        wdss29_log('success_v2:trying_fallback_by_user', array('user_id' => $uid));
+        
+        $order_row = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT * FROM {$table}
+                 WHERE status = 'pending'
+                 AND customer_id = %d
+                 AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                 ORDER BY id DESC
+                 LIMIT 1",
+                $uid
+            ),
+            ARRAY_A
+        );
+        
+        if ( $order_row ) {
+            wdss29_log('success_v2:fallback_found_order', array(
+                'order_id' => $order_row['id'],
+                'note' => 'Found by customer_id + recent timestamp'
+            ));
+        }
     }
 
-    $uid = 0;
-    $u   = wp_get_current_user();
-    if ($u && $u->ID) $uid = (int) $u->ID;
-
     if ( $order_row ) {
-        $wpdb->update(
+        $order_id = (int) $order_row['id'];
+
+        wdss29_log('success_v2:order_found', array(
+            'order_id' => $order_id,
+            'current_status' => $order_row['status'] ?? 'unknown',
+            'client_ref' => $client_ref,
+            'table' => $table
+        ));
+
+        // Update order to paid status in wd_orders table
+        $update_result = $wpdb->update(
             $table,
             array(
                 'status'     => 'paid',
@@ -956,49 +1065,117 @@ add_action('init', function () {
                 'total'      => $amount_total > 0 ? $amount_total : floatval($order_row['total']),
                 'customer_id'=> $uid ?: intval($order_row['customer_id']),
             ),
-            array( 'id' => intval($order_row['id']) ),
+            array( 'id' => $order_id ),
             array('%s','%s','%f','%d'),
             array('%d')
         );
 
-        // Ensure items are persisted (idempotent)
+        if ( $update_result === false ) {
+            wdss29_log('success_v2:update_failed', array(
+                'error' => $wpdb->last_error,
+                'order_id' => $order_id
+            ));
+        } else {
+            wdss29_log('success_v2:update_success', array(
+                'order_id' => $order_id,
+                'rows_affected' => $update_result
+            ));
+        }
+
+        // Verify the update worked
+        $verify = $wpdb->get_var( $wpdb->prepare(
+            "SELECT status FROM {$table} WHERE id = %d",
+            $order_id
+        ) );
+        wdss29_log('success_v2:status_after_update', array(
+            'order_id' => $order_id,
+            'status' => $verify
+        ));
+
+        // Re-persist items (idempotent - ensures they're saved)
         $meta = array();
         if ( isset($order_row['meta']) && $order_row['meta'] !== '' ) {
             $meta = json_decode($order_row['meta'], true);
         }
-        $cart = isset($meta['cart']) && is_array($meta['cart']) ? $meta['cart'] : array();
-        $norm = wdss29_normalize_cart_items($cart);
-        $rows = array();
-        foreach ($norm as $it) {
-            $pid  = intval($it['pid'] ?? 0);
-            $qty  = max(1, intval($it['qty'] ?? 1));
-            $opts = is_array($it['opts'] ?? null) ? $it['opts'] : array();
-            $base  = floatval(wdss29_get_product_price($pid));
-            $addon = floatval(wdss29_calc_addon_unit_price($opts));
-            $rows[] = array(
-                'product_id'  => $pid,
-                'quantity'    => $qty,
-                'unit_price'  => $base,
-                'addon_price' => $addon,
-                'line_total'  => ($base + $addon) * $qty,
-                'addons'      => $opts,
-            );
+        if ( is_array($meta) && ! empty($meta['cart']) && is_array($meta['cart']) ) {
+            $cart = $meta['cart'];
+            $norm = wdss29_normalize_cart_items($cart);
+            $rows = array();
+            foreach ($norm as $it) {
+                $pid  = intval($it['pid'] ?? 0);
+                $qty  = max(1, intval($it['qty'] ?? 1));
+                $opts = is_array($it['opts'] ?? null) ? $it['opts'] : array();
+                $base  = floatval(wdss29_get_product_price($pid));
+                $addon = floatval(wdss29_calc_addon_unit_price($opts));
+                $rows[] = array(
+                    'product_id'  => $pid,
+                    'quantity'    => $qty,
+                    'unit_price'  => $base,
+                    'addon_price' => $addon,
+                    'line_total'  => ($base + $addon) * $qty,
+                    'addons'      => $opts,
+                );
+            }
+            if ( function_exists('wdss29_save_order_items') ) {
+                wdss29_save_order_items( $order_id, $rows );
+            }
         }
-        wdss29_save_order_items( (int) $order_row['id'], $rows );
 
-        wdss29_log('success_v2:order_upgraded', array('id' => intval($order_row['id']), 'client_ref' => $client_ref));
-    } else {
-        // Insert a new paid row as fallback
-        $cust_email = '';
-        $cust_name  = '';
-        if (!empty($json['customer_details']) && is_array($json['customer_details'])) {
-            $cust_email = sanitize_email($json['customer_details']['email'] ?? '');
-            $cust_name  = sanitize_text_field($json['customer_details']['name'] ?? '');
+        // Build payload for email automation
+        $hints = array(
+            'customer_email' => $cust_email ?: ($order_row['customer_email'] ?? ''),
+            'customer_name'  => $cust_name ?: ($order_row['customer_name'] ?? ''),
+            'payment_method' => 'stripe',
+            'stripe_session_id' => $session_id,
+        );
+
+        $payload = array(
+            'order_id'       => $order_id,
+            'order_number'   => (string) $order_id,
+            'order_status'   => 'paid',
+            'status'         => 'paid',  // Alias for backward compatibility with conditions
+            'order_total'    => floatval($order_row['total']),
+            'currency'       => get_option('wdss_currency','USD'),
+            'customer_email' => $hints['customer_email'],
+            'customer_name'  => $hints['customer_name'],
+            'payment_method' => 'stripe',
+            '_idem_key'      => 'order.paid|' . $order_id,
+        );
+
+        // CRITICAL FIX: Fire email automation trigger with correct parameters
+        wdss29_log('success_v2:about_to_fire_email_trigger', array(
+            'event' => 'order.paid',
+            'order_id' => $order_id,
+            'customer_email' => $payload['customer_email'],
+            'has_customer_email' => !empty($payload['customer_email'])
+        ));
+        
+        do_action( 'wdss_email_trigger', 'order.paid', $order_id, $payload );
+
+        // Wake the email poller
+        if ( function_exists('wp_schedule_single_event') ) {
+            wp_schedule_single_event( time() + 5, 'wdss_email_order_poller_tick' );
+            wdss29_log('success_v2:email_poller_scheduled', array('timestamp' => time() + 5));
         }
+
+        wdss29_log('success_v2:order_marked_paid', array(
+            'order_id' => $order_id,
+            'email' => $hints['customer_email'],
+            'session_id' => $session_id,
+            'client_ref' => $client_ref
+        ));
+    } else {
+        // Fallback: create new paid order if no pending order found
+        wdss29_log('success_v2:no_pending_order', array(
+            'client_ref' => $client_ref,
+            'searched_table' => $table,
+            'note' => 'No pending order found with this client_reference_id - creating new order'
+        ));
+
         $meta = array(
             'stripe_session_id'   => $session_id,
             'client_reference_id' => $client_ref,
-            'from'                => 'success_v2_fallback_insert',
+            'from'                => 'success_fallback',
         );
         $new_id = wdss29_save_order(array(
             'customer_id'    => $uid,
@@ -1010,42 +1187,58 @@ add_action('init', function () {
             'meta'           => $meta,
         ));
 
-        // We have no cart on fallback; nothing to persist as items.
-        wdss29_log('success_v2:insert_new_paid', array('id' => $new_id, 'client_ref' => $client_ref));
+        if ( $new_id ) {
+            $payload = array(
+                'order_id'       => $new_id,
+                'order_number'   => (string) $new_id,
+                'order_status'   => 'paid',
+                'status'         => 'paid',  // Alias for backward compatibility with conditions
+                'order_total'    => $amount_total,
+                'currency'       => get_option('wdss_currency','USD'),
+                'customer_email' => $cust_email,
+                'customer_name'  => $cust_name,
+                'payment_method' => 'stripe',
+                '_idem_key'      => 'order.paid|' . $new_id,
+            );
+
+            wdss29_log('success_v2:firing_email_trigger', array(
+                'event' => 'order.paid',
+                'order_id' => $new_id,
+                'customer_email' => $cust_email,
+                'payload_keys' => array_keys($payload)
+            ));
+            
+            do_action( 'wdss_email_trigger', 'order.paid', $new_id, $payload );
+
+            if ( function_exists('wp_schedule_single_event') ) {
+                wp_schedule_single_event( time() + 5, 'wdss_email_order_poller_tick' );
+            }
+
+            wdss29_log('success_v2:fallback_order_created', array(
+                'id' => $new_id,
+                'email' => $cust_email,
+                'total' => $amount_total
+            ));
+        }
     }
 
     if ( function_exists('wdss29_empty_cart') ) wdss29_empty_cart();
 
+    // Set last order transient
     if ( $uid > 0 ) {
-        $oid = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT id FROM {$table} WHERE (customer_id = %d) AND status='paid' ORDER BY id DESC LIMIT 1",
-            $uid
-        ) );
-        if ( $oid ) set_transient('wdss29_last_order_user_' . $uid, $oid, 2 * HOUR_IN_SECONDS);
+        $final_order_id = isset($order_id) ? $order_id : (isset($new_id) ? $new_id : 0);
+        if ( $final_order_id > 0 ) {
+            set_transient('wdss29_last_order_user_' . $uid, $final_order_id, 2 * HOUR_IN_SECONDS);
+        }
     }
 
     wp_safe_redirect( home_url('/checkout-success/') );
     exit;
 }, 8);
 
-/** De-dupe by payment_id (early) */
-add_action('init', function () {
-    if (empty($_GET['wdss29']) || $_GET['wdss29'] !== 'success') return;
-    if (empty($_GET['session_id'])) return;
-
-    global $wpdb;
-    $table = $wpdb->prefix . 'wd_orders';
-    $session_id = sanitize_text_field($_GET['session_id']);
-
-    $already = (int) $wpdb->get_var(
-        $wpdb->prepare("SELECT COUNT(*) FROM {$table} WHERE payment_id=%s AND status='paid' LIMIT 1", $session_id)
-    );
-    if ($already > 0) {
-        if (function_exists('wdss29_empty_cart')) wdss29_empty_cart();
-        wp_safe_redirect(home_url('/checkout-success/'));
-        exit;
-    }
-}, 7);
+/** De-dupe by payment_id (early) - DISABLED: Now handled in main success handler above */
+// This function is no longer needed as duplicate checking is done in the main success handler
+// Left here as a comment for reference
 
 /** Ensure success page exists */
 add_action('admin_init', function () {
@@ -1248,7 +1441,7 @@ function wdss29_shortcode_my_orders( $atts = array(), $content = null ) {
         return '<p>You need to <a href="' . esc_url( $login_url ) . '">log in</a> to view your orders.</p>';
     }
 
-    wdss29_maybe_install_or_upgrade_orders_table();
+    wdss29_maybe_install_or_upgrade_wd_orders_table();
 
     $user  = wp_get_current_user();
     $uid   = intval( $user->ID );
@@ -1615,7 +1808,7 @@ if ( ! function_exists('wdss29_shortcode_orders_probe') ) {
         if ( ! current_user_can('manage_options') ) return '';
         global $wpdb;
 
-        wdss29_maybe_install_or_upgrade_orders_table();
+        wdss29_maybe_install_or_upgrade_wd_orders_table();
         wdss29_maybe_install_or_upgrade_order_items_table();
 
         $orders_table = $wpdb->prefix . 'wd_orders';

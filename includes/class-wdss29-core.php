@@ -240,8 +240,8 @@ if ( ! function_exists('wdss29_emit_order_paid') ) {
     function wdss29_emit_order_paid( $order_id, $hints = array() ) {
         $payload = wdss29_build_email_payload( $order_id, (array)$hints );
 
-        // Email Automations bus (kept with your 2-arg signature)
-        do_action( 'wdss_email_trigger', 'order.paid', $payload );
+        // FIXED: Email Automations bus wants (event_key, object_id, payload)
+        do_action( 'wdss_email_trigger', 'order.paid', (int)$order_id, $payload );
 
         // Optional back-compat
         do_action( 'wdss29_order_paid_normalized', (int)$order_id, $payload );
@@ -253,8 +253,8 @@ if ( ! function_exists('wdss29_emit_order_status_changed') ) {
         $payload['order_status'] = (string) $new_status;
         $payload['_idem_key'] = 'order.status_changed|' . $order_id . '|' . $new_status;
 
-        // Email Automations bus (kept with your 2-arg signature)
-        do_action( 'wdss_email_trigger', 'order.status_changed', $payload );
+        // FIXED: Email Automations bus wants (event_key, object_id, payload)
+        do_action( 'wdss_email_trigger', 'order.status_changed', (int)$order_id, $payload );
 
         // Optional back-compat
         do_action( 'wdss29_order_status_changed_normalized', (int)$order_id, (string)$new_status, $payload );
@@ -321,7 +321,8 @@ if ( ! function_exists( 'wdss29_capture_success_on_redirect' ) ) {
                 'customer_name'  => '',
                 '_idem_key'      => 'order.paid|' . $order_id,
             );
-            do_action( 'wdss_email_trigger', 'order.pid', $payload ); // keeps your bus alive even without helpers
+            // FIXED: Email Automations bus wants (event_key, object_id, payload)
+            do_action( 'wdss_email_trigger', 'order.paid', (int)$order_id, $payload );
         }
 
         if ( function_exists( 'wp_schedule_single_event' ) ) {
@@ -335,218 +336,3 @@ if ( ! function_exists( 'wdss29_capture_success_on_redirect' ) ) {
     }
     add_action( 'template_redirect', 'wdss29_capture_success_on_redirect', 1 );
 }
-
-// === WDSS Success Page handler with fallback ===
-// Works with either a proper Stripe session_id or (fallback) the last saved order for the logged-in user.
-
-if ( ! function_exists( 'wdss29_handle_checkout_success' ) ) {
-    function wdss29_handle_checkout_success() {
-        if ( empty($_GET['wdss29']) || $_GET['wdss29'] !== 'success' ) return;
-
-        $user_id = get_current_user_id();
-        if ( ! $user_id ) return; // only handling logged-in flow as requested
-
-        $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
-        $key      = isset($_GET['key']) ? sanitize_text_field($_GET['key']) : '';
-        $sid      = isset($_GET['session_id']) ? sanitize_text_field($_GET['session_id']) : '';
-
-        // Validate the signed guard if provided
-        $guard_ok = false;
-        if ( $order_id && $key ) {
-            if ( function_exists('wdss29_build_success_key') ) {
-                $expected = wdss29_build_success_key( $order_id, $user_id );
-            } else {
-                $expected = hash_hmac( 'sha256', (int)$order_id . '|' . (int)$user_id, wp_salt('auth') );
-            }
-            $guard_ok = hash_equals( $expected, $key );
-        }
-
-        // Idempotency: avoid double-firing
-        $idem = 'wdss_success_emit_' . ( $order_id ? $order_id : $user_id );
-        if ( get_transient( $idem ) ) return;
-
-        // Fallback to last saved order if guard missing/invalid
-        if ( ! $guard_ok ) {
-            $fallback_order = (int) get_user_meta( $user_id, '_wdss_last_order', true );
-            if ( $fallback_order > 0 ) {
-                $order_id = $fallback_order;
-                $guard_ok = true; // treat as trusted for logged-in user flow
-            }
-        }
-
-        if ( ! $guard_ok || ! $order_id ) {
-            // Optional: debug breadcrumb
-            do_action( 'wdss_email_trigger', 'order.debug', array(
-                'note' => 'success_no_guard_or_order',
-                'uid'  => (int) $user_id,
-                'sid'  => $sid,
-            ) );
-            return;
-        }
-
-        // Mark paid and emit emails
-        $hints = array( 'source' => ( $sid && $sid !== 'CHECKOUT_SESSION_ID' ) ? 'success_redirect_session' : 'success_redirect_fallback' );
-
-        if ( function_exists( 'wdss29_set_order_status' ) ) {
-            wdss29_set_order_status( $order_id, 'paid', $hints );
-        }
-
-        if ( function_exists( 'wdss29_emit_order_paid' ) ) {
-            wdss29_emit_order_paid( $order_id, $hints );
-        } else {
-            // minimal payload
-            $payload = array(
-                'order_id'     => (int) $order_id,
-                'order_status' => 'paid',
-                '_idem_key'    => 'order.paid|' . (int)$order_id,
-            );
-            do_action( 'wdss_email_trigger', 'order.paid', $payload );
-        }
-
-        if ( function_exists( 'wp_schedule_single_event' ) ) {
-            wp_schedule_single_event( time() + 5, 'wdss_email_order_poller_tick' );
-        }
-
-        // Clear last-order pointer and set idempotency
-        delete_user_meta( $user_id, '_wdss_last_order' );
-        set_transient( $idem, 1, 10 * MINUTE_IN_SECONDS );
-    }
-    add_action( 'template_redirect', 'wdss29_handle_checkout_success', 1 );
-}
-
-// === WDSS Success Page finisher (guests + logged-in) ===
-// Resolves order_id from signed params, cookie, user meta, or Stripe session_id,
-// then marks PAID and emits the email trigger. Adds detailed debug logs.
-if ( ! function_exists( 'wdss29_finish_success' ) ) {
-    function wdss29_finish_success() {
-        if ( empty($_GET['wdss29']) || $_GET['wdss29'] !== 'success' ) return;
-
-        $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
-        $uid      = isset($_GET['uid']) ? absint($_GET['uid']) : 0;
-        $key      = isset($_GET['key']) ? sanitize_text_field($_GET['key']) : '';
-        $sid      = isset($_GET['session_id']) ? sanitize_text_field($_GET['session_id']) : '';
-        $user_id  = get_current_user_id();
-
-        $dbg = array(
-            'note' => 'success_entry',
-            'order_id_qs' => $order_id,
-            'uid_qs'      => $uid,
-            'has_key'     => $key ? 1 : 0,
-            'sid'         => $sid,
-            'user_id'     => (int)$user_id,
-            'cookie'      => isset($_COOKIE['wdss_last_order']) ? (int)$_COOKIE['wdss_last_order'] : 0,
-        );
-        error_log('[WDSS] success handler: ' . json_encode($dbg));
-
-        // (A) validate signed guard if present
-        $guard_ok = false;
-        if ( $order_id && $key ) {
-            $expected = function_exists('wdss29_build_success_key')
-                ? wdss29_build_success_key( $order_id, $uid )
-                : hash_hmac( 'sha256', (int)$order_id . '|' . (int)$uid, wp_salt('auth') );
-            $guard_ok = hash_equals( $expected, $key );
-            if ( ! $guard_ok ) error_log('[WDSS] success: signed guard mismatch');
-        }
-
-        // (B) cookie fallback
-        if ( ! $guard_ok || ! $order_id ) {
-            if ( ! empty($_COOKIE['wdss_last_order']) ) {
-                $cookie_order = absint( $_COOKIE['wdss_last_order'] );
-                if ( $cookie_order > 0 ) {
-                    $order_id = $cookie_order;
-                    $guard_ok = true;
-                    error_log('[WDSS] success: resolved via cookie -> ' . $order_id);
-                }
-            }
-        }
-
-        // (C) logged-in fallback via user meta
-        if ( ! $guard_ok || ! $order_id ) {
-            if ( is_user_logged_in() ) {
-                $meta_order = (int) get_user_meta( $user_id, '_wdss_last_order', true );
-                if ( $meta_order > 0 ) {
-                    $order_id = $meta_order;
-                    $guard_ok = true;
-                    error_log('[WDSS] success: resolved via user meta -> ' . $order_id);
-                }
-            }
-        }
-
-        // (D) Stripe session lookup when we have a real session id
-        if ( ! $guard_ok || ! $order_id ) {
-            if ( $sid && $sid !== 'CHECKOUT_SESSION_ID' && class_exists('\Stripe\Stripe') ) {
-                $settings = get_option('wdss29_settings', array());
-                $sk = isset($settings['stripe_sk']) ? trim($settings['stripe_sk']) : '';
-                if ( $sk ) {
-                    try {
-                        \Stripe\Stripe::setApiKey($sk);
-                        $session = \Stripe\Checkout\Session::retrieve($sid, ['expand' => ['payment_intent']]);
-                        if ( ! empty($session->metadata->order_id) ) {
-                            $order_id = (int) $session->metadata->order_id;
-                        } elseif ( ! empty($session->client_reference_id) ) {
-                            $order_id = (int) $session->client_reference_id;
-                        } elseif ( ! empty($session->payment_intent->metadata->order_id) ) {
-                            $order_id = (int) $session->payment_intent->metadata->order_id;
-                        }
-                        if ( $order_id ) {
-                            $guard_ok = true;
-                            error_log('[WDSS] success: resolved via Stripe session lookup -> ' . $order_id);
-                        }
-                    } catch ( \Exception $e ) {
-                        error_log('[WDSS] success: Stripe session lookup failed: ' . $e->getMessage());
-                    }
-                }
-            }
-        }
-
-        if ( ! $guard_ok || ! $order_id ) {
-            error_log('[WDSS] success: unable to resolve order');
-            do_action( 'wdss_email_trigger', 'order.debug', array(
-                'note' => 'success_no_order_resolved',
-                'sid'  => $sid,
-            ));
-            return;
-        }
-
-        // Idempotency: prevent double-firing
-        $idem = 'wdss_success_emit_' . (int)$order_id;
-        if ( get_transient( $idem ) ) {
-            error_log('[WDSS] success: already emitted for ' . (int)$order_id);
-            return;
-        }
-
-        // Mark PAID
-        $source = ($sid && $sid !== 'CHECKOUT_SESSION_ID') ? 'success_session' : 'success_fallback';
-        if ( function_exists( 'wdss29_set_order_status' ) ) {
-            wdss29_set_order_status( $order_id, 'paid', array('source'=>$source) );
-        } else {
-            update_post_meta( (int)$order_id, '_wdss_status', 'paid' );
-            error_log('[WDSS] success: set _wdss_status=paid (fallback) for ' . (int)$order_id);
-            // still emit order.paid for email engine
-            do_action( 'wdss_email_trigger', 'order.paid', array(
-                'order_id'  => (int)$order_id,
-                'order_status'=>'paid',
-                '_idem_key' => 'order.paid|' . (int)$order_id,
-            ));
-        }
-
-        // Kick the mailer poller (if you use it)
-        if ( function_exists( 'wp_schedule_single_event' ) ) {
-            wp_schedule_single_event( time() + 5, 'wdss_email_order_poller_tick' );
-        }
-
-        // Clean pointers + set idempotency
-        if ( isset($_COOKIE['wdss_last_order']) ) {
-            setcookie('wdss_last_order', '', time() - 3600, COOKIEPATH ?: '/', COOKIE_DOMAIN ?: '', is_ssl(), true);
-        }
-        if ( is_user_logged_in() ) {
-            delete_user_meta( $user_id, '_wdss_last_order' );
-        }
-        set_transient( $idem, 1, 10 * MINUTE_IN_SECONDS );
-
-        error_log('[WDSS] success: finished for order ' . (int)$order_id);
-    }
-    add_action( 'init', 'wdss29_finish_success', 1 );
-    add_action( 'template_redirect', 'wdss29_finish_success', 1 );
-}
-
